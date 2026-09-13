@@ -583,6 +583,8 @@ struct n2n_edge
     n2n_mac_t           sn1_mac;        /* MAC of the SN the edge is currently registered with. */
     n2n_sock_t          sn1_v6;         /* sn1's IPv6 address (as reported by sn1 in the ACK). */
     uint8_t             sn_ack_backup[N2N_EDGE_NUM_SUPERNODES]; /* indices whose entry came from the sn1 ACK (backup). */
+    uint8_t             sn_ak_parsed;   /* sn1's ACK backup string parsed (learnt or already present) */
+    char                sn_bak_masked[N2N_EDGE_SN_HOST_SIZE]; /* ACK-learned brother: masked display copy ('*' + tail) */
     uint8_t             sn_relay_fails;   /* consecutive relay send failures, reset on success */
     n2n_cookie_t        last_cookie;
     uint8_t             sn_ack_count;
@@ -603,6 +605,12 @@ struct n2n_edge
     uint8_t             nat_bounce_seen;   /* a public helper-port bounce arrived */
     uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
     uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
+    time_t              fc_arm_time;    /* when the stranger window was last (re-)armed:
+                                           an armed window gets its quick NAT re-probe
+                                           12s later instead of waiting for the 300s
+                                           periodic tick */
+    uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
+                                           re-trigger the brother's N2NF probe (mgmt "n") */
 
     n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
                                            reported to supernode for IPv6 hole-punching

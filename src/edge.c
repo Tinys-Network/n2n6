@@ -379,6 +379,8 @@ static int edge_init(n2n_edge_t * eee)
     memset(eee->sn1_mac, 0, sizeof(eee->sn1_mac));
     memset(&eee->sn1_v6, 0, sizeof(eee->sn1_v6));
     memset(eee->sn_ack_backup, 0, sizeof(eee->sn_ack_backup));
+    eee->sn_ak_parsed = 0;
+    memset(eee->sn_bak_masked, 0, sizeof(eee->sn_bak_masked));
     memset(&eee->sn_query, 0, sizeof(n2n_sock_t));
     memset(&eee->sn1_probe_addr, 0, sizeof(n2n_sock_t));
     eee->sn_probe_cookie_valid = 0;
@@ -390,6 +392,8 @@ static int edge_init(n2n_edge_t * eee)
     eee->nat_bounce_seen = 0;
     eee->fc_seen = 0;
     eee->fc_window = 1;
+    eee->fc_arm_time = 0; /* 0 arms the quick probe for 12s after start */
+    eee->nat_reprobe = 0;
     eee->sn_query_index = 1;
     eee->sn_backup_index = 1;
     eee->sn_af = AF_UNSPEC;
@@ -1295,6 +1299,13 @@ static int mac_nonzero( const uint8_t * mac )
     return mac[0] || mac[1] || mac[2] || mac[3] || mac[4] || mac[5];
 }
 
+/** True when slot holds the ACK-learned brother supernode (the one
+ * reported in sn1's ACK, i.e. an address we did NOT get from -l). */
+static int sn_is_ack_brother( n2n_edge_t * eee, int slot )
+{
+    return slot >= 0 && slot < (int)eee->sn_num && eee->sn_ack_backup[slot];
+}
+
 /** Persist sn1's current address learned from an sn2 ask_backup reply.
  * Prefers the DNS-style string (stable across DNS changes) and falls back
  * to formatting the binary sock when sn2 has no -b. Syncs sn1_current_addr
@@ -1423,6 +1434,15 @@ static void send_register_super( n2n_edge_t * eee,
         case N2N_NAT_PORT_RESTRICT: reg.aflags |= N2N_AFLAGS_NAT_PORT_RESTRICT; break;
         case N2N_NAT_SYMMETRIC:     reg.aflags |= N2N_AFLAGS_NAT_SYMMETRIC; break;
         }
+
+        /* One-shot manual NAT re-probe (mgmt "n"): ask the SN to re-trigger
+         * the brother's N2NF probe even though this registration is not a
+         * new/remapped edge. */
+        if ( eee->nat_reprobe )
+        {
+            reg.aflags |= N2N_AFLAGS_NAT_REPROBE;
+            eee->nat_reprobe = 0;
+        }
     }
 
     /* Relay stance advertised to SN for community-relay selection:
@@ -1478,8 +1498,16 @@ static void send_register_super( n2n_edge_t * eee,
     idx=0;
     encode_REGISTER_SUPER( pktbuf, &idx, &cmn, &reg );
 
-    traceEvent( TRACE_INFO, "send REGISTER_SUPER to %s",
-        sock_to_cstr( sockbuf, supernode ) );
+    {
+        int to_brother = 0;
+        if ( supernode == &(eee->sn_query) )
+            to_brother = sn_is_ack_brother( eee, eee->sn_query_index );
+        else if ( supernode == &(eee->supernode) )
+            to_brother = sn_is_ack_brother( eee, eee->sn_idx );
+        traceEvent( TRACE_INFO, "send REGISTER_SUPER to %s",
+                    to_brother ? eee->sn_bak_masked
+                               : sock_to_cstr( sockbuf, supernode ) );
+    }
 
     /* edge_send_to_sn always targets eee->supernode (sn1); when this packet
      * is meant for another supernode (e.g. the sn2 MAC lookup / ask_backup
@@ -1496,7 +1524,9 @@ static void send_register_super( n2n_edge_t * eee,
         SOCKET alt_sock = (eee->supernode_alt.family == AF_INET6) ? eee->udp_sock6 : eee->udp_sock;
         if (alt_sock != -1) {
             traceEvent(TRACE_INFO, "send REGISTER_SUPER (alt) to %s",
-                       sock_to_cstr(sockbuf, &eee->supernode_alt));
+                       sn_is_ack_brother( eee, eee->sn_idx )
+                       ? eee->sn_bak_masked
+                       : sock_to_cstr(sockbuf, &eee->supernode_alt));
             sendto_sock(alt_sock, pktbuf, idx, &eee->supernode_alt);
         }
     }
@@ -2703,17 +2733,18 @@ static void nat_classify( n2n_edge_t * eee )
     pub2 = ( eee->nat_seen_sn2.family == AF_INET &&
              !nat_addr_private( eee->nat_seen_sn2.addr.v4 ) );
 
-    if ( pub1 && pub2 )
+    if ( eee->fc_seen )
+        /* Strongest evidence: a N2NF probe from the never-contacted brother
+         * crossed the NAT, so the filter admits ANY source -> full cone,
+         * regardless of how the two per-destination mappings differ. */
+        new_type = N2N_NAT_FULL_CONE;
+    else if ( pub1 && pub2 )
     {
         /* Two public observations: compare the mappings toward two
          * different destinations. */
         if ( memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
              eee->nat_seen_sn1.port != eee->nat_seen_sn2.port )
             new_type = N2N_NAT_SYMMETRIC;
-        else if ( eee->fc_seen )
-            /* The never-contacted sn2 probe got through: the filter does
-             * not even check the source IP -> full cone. */
-            new_type = N2N_NAT_FULL_CONE;
         else if ( eee->nat_bounce_seen )
             new_type = N2N_NAT_RESTRICTED;
         else
@@ -2721,13 +2752,6 @@ static void nat_classify( n2n_edge_t * eee )
              * (every registration carried a bounce request, and the sn
              * bounces before ACKing) -> port-restricted. */
             new_type = N2N_NAT_PORT_RESTRICT;
-    }
-    else if ( eee->fc_seen )
-    {
-        /* No second observation yet, but the N2NF probe from the
-         * never-contacted brother sn crossed the NAT: the filter admits
-         * any source -> full cone regardless of the first mapping. */
-        new_type = N2N_NAT_FULL_CONE;
     }
     else if ( eee->nat_bounce_seen )
     {
@@ -2843,7 +2867,9 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         eee->sn_wait = 1;
         eee->last_register_req = nowTime;
         traceEvent(TRACE_WARNING, "sn_all_failed cooldown: re-probing sn2 (%s)",
-                   sock_to_cstr(sockbuf, &eee->sn_query));
+                   sn_is_ack_brother( eee, eee->sn_query_index )
+                   ? eee->sn_bak_masked
+                   : sock_to_cstr(sockbuf, &eee->sn_query));
         return;
     }
 
@@ -2874,20 +2900,29 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         return;
     }
 
-    /* Phase 2.5: NAT type probe (normal mode only, every 5 min).
+    /* Phase 2.5: NAT type probe (normal mode).
      * One-shot QUERY_ONLY probe to the sn2 query channel so its ACK echoes
      * the NAT mapping observed from a second destination (nat_classify).
      * Skipped while failover/ask_backup is active (Phase 3 probes refresh
      * nat_seen_sn2 anyway) and when sn_query IS the current supernode
-     * (its registration ACK already provides the second observation). */
+     * (its registration ACK already provides the second observation).
+     * Two triggers share one action:
+     *   - quick: 12s after fc_arm_time (startup / remap / mgmt "n"
+     *     re-arm it), so a fresh stranger window still has its window open
+     *     while sn2's brother N2NF probes usually land within the first
+     *     seconds;
+     *   - periodic: 300s safety net in case a quick probe got lost.
+     * The armed snapshot is consumed on fire (fc_arm_time = now) so an
+     * armed window probes exactly once, never on every loop tick. */
     if ( eee->sn_num >= 2 && !eee->use_ws && eee->sn_idx == 0 &&
          !eee->sn_ask_backup && !eee->sn_all_failed &&
          eee->sn_query.family != 0 &&
          sock_equal( &(eee->sn_query), &(eee->supernode) ) != 0 &&
-         nowTime > eee->start_time + 60 &&
-         nowTime > eee->nat_probe_time + 300 )
+         ( nowTime > eee->fc_arm_time + 12 ||
+           nowTime > eee->nat_probe_time + 300 ) )
     {
         eee->nat_probe_time = nowTime;
+        eee->fc_arm_time = nowTime; /* consume the quick-probe snapshot */
         eee->nat_probe_pending = 1;
         random_bytes( NULL, eee->sn_probe_cookie, N2N_COOKIE_SIZE );
         eee->sn_probe_cookie_valid = 1;
@@ -3999,6 +4034,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                                 "  -       Decrease verbosity of logging\n"
                                 "  b       Toggle bypass on/off\n"
                                 "  f       Sync peers with supernode\n"
+                                "  n       Re-run NAT type detection\n"
                                 "  <enter> Display statistics\n\n");
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
@@ -4046,6 +4082,53 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             eee->last_register_req = n2n_now();
             msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                 "> peer sync started...\n");
+            sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
+                   (struct sockaddr*) &sender_sock, i);
+            return;
+        }
+
+        if (recvlen >= 1 && 0 == memcmp(udp_buf, "n", 1)) {
+            msg_len = 0;
+            /* A second observation point (the sn2 query channel) is needed:
+             * without it there is nothing to compare against. */
+            if ( eee->sn_query.family == 0 ) {
+                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                    "> no query channel yet (brother not learned)\n");
+                sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
+                       (struct sockaddr*) &sender_sock, i);
+                return;
+            }
+            /* Reset the whole classification state: the old verdict belongs
+             * to the previous exercise, and re-arming the stranger window
+             * lets a fresh N2NF probe count again. */
+            eee->nat_type = N2N_NAT_UNKNOWN;
+            memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
+            memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+            eee->nat_bounce_seen = 0;
+            eee->fc_seen = 0;
+            eee->fc_window = 1;
+            /* Let the brother's N2NF probes (fired within a few seconds of
+             * the REPROBE registration) land while the stranger window is
+             * still open; the QUERY_ONLY first-contact that closes it is
+             * therefore delayed to 32s out instead of the usual 12s. */
+            eee->fc_arm_time = n2n_now() + 20;
+            eee->nat_probe_time = eee->fc_arm_time;
+            eee->nat_probe_pending = 0;
+            eee->sn_probe_cookie_valid = 0;
+            /* sn1 registration fires at once: nat_type is UNKNOWN again, so
+             * it re-carries the NAT bounce request; the N2N_AFLAGS_NAT_REPROBE
+             * bit asks the SN to re-trigger the brother's N2NF probe even
+             * without a remap (window is armed, so it counts again). The
+             * QUERY_ONLY probe to sn2 runs through the delayed quick window
+             * this command armed (32s out), leaving the stranger window open
+             * long enough for the N2NF probes to land first. */
+            if ( eee->supernode.family != 0 )
+            {
+                eee->nat_reprobe = 1; /* one-shot, consumed by send_register_super */
+                send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+            }
+            msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                "> NAT re-probe started (sn1 bounce + brother N2NF now, sn2 QUERY_ONLY in ~32s)\n");
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
             return;
@@ -4336,6 +4419,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
              * IPv6 (keep a leading chunk, a '*', and the bracketed tail with
              * the full port) instead of hard-truncating and losing the port. */
             const char *sn_host = eee->sn_ip_array[sn_i];
+            /* ACK-learned brother: show the masked display copy instead */
+            if ( sn_is_ack_brother(eee, sn_i) && eee->sn_bak_masked[0] )
+                sn_host = eee->sn_bak_masked;
             char host[N2N_SOCKBUF_SIZE + 1] = "";
             if (sn_i == 0 && eee->sn1_v6.family == AF_INET6)
             {
@@ -4373,13 +4459,18 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             }
             /* Fixed column widths -> fixed left edges for every group.
              * Over-long content is truncated (like the sample layout):
-             * marker 2, mac 17, host 50, "supp:" 14, "conn:" 9, tok 5, +B. */
+             * marker 2, mac 17, host 49, "supp:" 14, "conn:" 9, tok 5, +B. */
             char sup_field[20];
             char conn_field[16];
-            snprintf(sup_field, sizeof(sup_field), "supp:%s", sn_support);
+            /* "supp" is a single shared value learned from the latest ACK:
+             * it only describes sn1. For the ACK-learned brother show '-' */
+            if ( eee->sn_ack_backup[sn_i] )
+                snprintf(sup_field, sizeof(sup_field), "supp:-");
+            else
+                snprintf(sup_field, sizeof(sup_field), "supp:%s", sn_support);
             snprintf(conn_field, sizeof(conn_field), "conn:%s", conn_str);
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               "%-2.2s  %-17.17s  %-50.50s  %-14.14s  %-9.9s  %-5.5s  %s\n",
+                               " %-2.2s  %-17.17s  %-49.49s  %-14.14s  %-9.9s  %-5.5s  %s\n",
                                marker, mac_str, sn_host, sup_field,
                                conn_field, tok_str, b_marker);
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
@@ -5615,7 +5706,7 @@ process_n2n_packet:
                          * first ACK came from the failover target — still picks
                          * the query channel up after failing back to sn1. */
                         if (eee->sn_idx == 0 && ra.sn_bak_str_len > 0 &&
-                            !eee->sn_ack_backup[1])
+                            !eee->sn_ak_parsed)
                         {
                             char bakstr[N2N_EDGE_SN_HOST_SIZE];
                             size_t blen = ra.sn_bak_str_len;
@@ -5651,9 +5742,24 @@ process_n2n_packet:
                                                 eee->sn_ip_array[1] );
                                 if ( eee->sn_backup_index == 1 && eee->sn_num > 2 )
                                     eee->sn_backup_index = 2;
-                                traceEvent(TRACE_NORMAL, "Brother supernode: %s", bakstr);
+                                eee->sn_ack_backup[1] = 1; /* slot 1 now holds the ACK-learned brother */
+                                /* From here the address exists twice: the raw copy
+                                 * (sn_ip_array[1], used for all run-time traffic) and
+                                 * a masked display copy (sn_bak_masked, built here
+                                 * once — hide the first 5 chars with a '*'). Every
+                                 * display/logging site just reads sn_bak_masked. */
+                                {
+                                    size_t hl = strlen(bakstr);
+                                    if ( hl > 5 )
+                                        snprintf(eee->sn_bak_masked, sizeof(eee->sn_bak_masked),
+                                                 "*%s", bakstr + 5);
+                                    else
+                                        snprintf(eee->sn_bak_masked, sizeof(eee->sn_bak_masked), "*");
+                                    traceEvent(TRACE_NORMAL, "Brother supernode: %s",
+                                               eee->sn_bak_masked);
+                                }
                             }
-                            eee->sn_ack_backup[1] = 1; /* learned (or nothing to learn): stop re-parsing */
+                            eee->sn_ak_parsed = 1; /* learned (or nothing to learn): stop re-parsing */
                         }
 
                         if (!initial_connection_complete && eee->daemon) {
@@ -5702,8 +5808,12 @@ process_n2n_packet:
                                  * 300s timer happened to fire right at the
                                  * remap, that first-contact packet would slam
                                  * the fresh stranger window shut before the
-                                 * brother's N2NF probes land. */
+                                 * brother's N2NF probes land. fc_arm_time
+                                 * instead schedules one quick probe 12s out
+                                 * (fast symmetric/port-restrict verdict
+                                 * without stealing the brother's window). */
                                 eee->nat_probe_time = now;
+                                eee->fc_arm_time = now;
                             }
 
                             /* First observation for NAT classification: which sn
@@ -6314,8 +6424,10 @@ static int check_supernode_domain_and_update(n2n_edge_t * eee, time_t now)
         sock_equal(&eee->last_resolved_supernode, &new_addr) != 0)
     {
         n2n_sock_str_t new_str;
-        sock_to_cstr(new_str, &new_addr);
-        traceEvent(TRACE_NORMAL, "Supernode address updated to %s", new_str);
+        traceEvent(TRACE_NORMAL, "Supernode address updated to %s",
+                   sn_is_ack_brother( eee, eee->sn_idx )
+                   ? eee->sn_bak_masked
+                   : sock_to_cstr(new_str, &new_addr));
         
         /* Update supernode address and re-register */
         eee->supernode = new_addr;
@@ -6376,8 +6488,10 @@ static int check_http_redirect_and_update(n2n_edge_t *eee, time_t now) {
 
     if (eee->last_http_supernode.family != 0 && sock_equal(&eee->last_http_supernode, &new_addr) != 0) {
         n2n_sock_str_t new_str;
-        sock_to_cstr(new_str, &new_addr);
-        traceEvent(TRACE_NORMAL, "HTTP redirect: supernode address changed to %s", new_str);
+        traceEvent(TRACE_NORMAL, "HTTP redirect: supernode address changed to %s",
+                   sn_is_ack_brother( eee, eee->sn_idx )
+                   ? eee->sn_bak_masked
+                   : sock_to_cstr(new_str, &new_addr));
         eee->supernode = new_addr;
         eee->last_http_supernode = new_addr;
         memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
