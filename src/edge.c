@@ -808,7 +808,7 @@ static void help() {
     #endif
     printf("\n");
     printf("                         : A5 = Speck(-k). '-A1' can also be used as '-A 1' (default: chacha20).\n");
-    printf("-c <community>           | N2n community name the edge belongs to.\n");
+    printf("-c <community>           | N2n community name the edge belongs to (ASCII, max 15).\n");
     printf("-k <encrypt key>         | Encryption key (ASCII, max 32) - also N2N_KEY=<encrypt key>.\n");
     printf("-l <supernode host:port> | Supernode address Formats:\n");
     printf("                         : 1 host:port  - direct address, common format (e.g. 1.2.3.4:5678)\n");
@@ -1731,15 +1731,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
         {
             scan->punch_failed = 1;
             scan->punch_reset_time = now;
-            if (memcmp(scan->mac_addr, eee->last_psp_log_mac, N2N_MAC_SIZE)) {
-                /* This peer failed hole-punching so it can't go direct; it is
-                 * relayed via the community edge relay, not the supernode —
-                 * unless the relay is unavailable, in which case the send path
-                 * falls back to the supernode transparently. */
-                traceEvent(TRACE_NORMAL, "PsP (edge relay) for %s",
-                           PEER_ID(mac_tmp, scan));
-                memcpy(eee->last_psp_log_mac, scan->mac_addr, N2N_MAC_SIZE);
-            }
         } else if ( scan->punch_start_time != 0 &&
                     !scan->punch_failed &&
                     (now - scan->punch_start_time) <= 5 &&
@@ -3720,11 +3711,27 @@ static int handle_PACKET( n2n_edge_t * eee,
         from_relay = 1;
     if (from_relay && eee->relay_proven == 0)
     {
-        char vip[16]; n2n_sock_str_t relbuf;
-        const char * where = relay_virt_ip_str( eee, vip, sizeof vip );
-        if ( vip[0] == '-' ) where = sock_to_cstr( relbuf, &eee->relay_sock );
+        /* First frame actually delivered back through the community relay:
+         * the relay path is proven end to end. Same wording as the historical
+         * punch-failure marker so P2P-direct / edge-relay / supernode states
+         * read side by side in the log; the acting relay itself is marked
+         * with '*' on the management page. */
         eee->relay_proven = now;
-        traceEvent( TRACE_NORMAL, "Relay path proven via %s", where );
+        uint32_t pip = 0;
+        n2n_mac_t pmac;
+        {
+            struct peer_info *psp_peer = NULL;
+            PEERS_LOCK(eee);
+            psp_peer = find_peer_by_mac(eee->known_peers, pkt->srcMac);
+            if (!psp_peer) psp_peer = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
+            if (psp_peer) { pip = psp_peer->assigned_ip;
+                            memcpy(pmac, psp_peer->mac_addr, N2N_MAC_SIZE); }
+            PEERS_UNLOCK(eee);
+        }
+        macstr_t mb;
+        traceEvent( TRACE_NORMAL, "PsP (edge relay) for %s",
+                    (pip != 0) ? peer_id_str_impl(mb, pip, pmac)
+                               : macaddr_str(mb, pkt->srcMac) );
     }
     else if (from_relay)
         eee->relay_proven = now;
@@ -4325,9 +4332,12 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                     }
                 }
             }
+            /* '*' marks the row that is the current community relay */
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %2u  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
-                               id++, macaddr_str(mac, peer->mac_addr), virt_ip,
+                               " %2u%c  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               id++,
+                               (memcmp(peer->mac_addr, eee->relay_mac, N2N_MAC_SIZE) == 0) ? '*' : ' ',
+                               macaddr_str(mac, peer->mac_addr), virt_ip,
                                wan, version, os_name,
                                N2N_NAT_NAME(peer->nat_type));
         }

@@ -658,7 +658,6 @@ struct n2n_edge
     /* Rate-limiting for P2P/PsP log messages */
     uint8_t             last_p2p_log_mac[N2N_MAC_SIZE];
     n2n_sock_t          last_p2p_log_addr;
-    uint8_t             last_psp_log_mac[N2N_MAC_SIZE];
 
     /* Bypass module */
     bypass_context_t   *bp;
