@@ -611,6 +611,10 @@ struct n2n_edge
                                            periodic tick */
     uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
                                            re-trigger the brother's N2NF probe (mgmt "n") */
+    time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured
+                                           local port again once this time is reached (0 = none) */
+    uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
+                                           my_public_sock, keeps the fresh NAT verdict */
 
     n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
                                            reported to supernode for IPv6 hole-punching
