@@ -2104,17 +2104,27 @@ static void check_relay( n2n_edge_t * eee, time_t now )
 
     {
         struct peer_info *scan;
+        int nonrelay = 0;
+        int need_relay = 0;
         PEERS_LOCK(eee);
-        /* Only leave relay when ALL non-relay known peers have a direct path.
-         * Under mixed topology (some peers reachable, others still need the relay)
-         * the old "any single direct peer" heuristic triggered premature leave,
-         * causing the relay to flap on/off repeatedly. scan becomes NULL only
-         * when no non-relay peer is found with direct_seen == 0, meaning every
-         * data peer we need to talk to has already established a direct link. */
+        /* Only leave the relay when the known set actually contains at least
+         * one non-relay peer AND every one of them has a confirmed direct
+         * path, AND no pending peer still needs the relay. An empty
+         * known_peers (nothing promoted yet) must NOT count as "everything
+         * is direct" — the vacuous case previously triggered
+         * 'P2P direct up - leaving relay' with zero direct peers. Pending
+         * peers have no confirmed direct path (Principle 4: direct must be
+         * confirmed by the peer), so they keep the relay alive as well. */
         for (scan = eee->known_peers; scan; scan = scan->next)
-            if (scan->direct_seen == 0 && !peer_is_the_relay( eee, scan )) break;
+        {
+            if (peer_is_the_relay( eee, scan )) continue;
+            nonrelay++;
+            if (scan->direct_seen == 0) { need_relay = 1; break; }
+        }
+        if (!need_relay && eee->pending_peers != NULL)
+            need_relay = 1;
         PEERS_UNLOCK(eee);
-        if (!scan) { /* all non-relay known peers are direct -> no more relaying needed */
+        if (!need_relay && nonrelay > 0) { /* all non-relay known peers are direct -> no more relaying needed */
             eee->relay_valid = 0;
             eee->relay_proven = 0;
             traceEvent( TRACE_NORMAL, "P2P direct up - leaving relay" );
@@ -2132,9 +2142,13 @@ static void check_relay( n2n_edge_t * eee, time_t now )
     if ( eee->relay_last_ack > 0 &&
          (now - eee->relay_last_ack) > RELAY_ACK_SECS )
     {
-        eee->relay_giveup  = 1;
-        eee->relay_probe_next = now + 35;
+        /* Log and latch the giveup state exactly once per transition.
+         * Without the guard, every tick while the relay stays silent
+         * would re-hit the condition and spam the log line below. */
+        if ( !eee->relay_giveup )
         {
+            eee->relay_giveup  = 1;
+            eee->relay_probe_next = now + 35;
             traceEvent( TRACE_NORMAL, "Relay unresponsive - falling back to SN" );
         }
     }
@@ -4301,8 +4315,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             peer = peer->next;
             continue;
         }
-        /* Members being relayed belong to the relay: section below; show them
-         * there instead of duplicating them in P2P_with. */
+        /* Peers that register to this relay are listed in the Relay: section
+         * (whether or not they also have a direct path); P2P_with keeps
+         * only peers with no relay relationship, so nothing is duplicated. */
         if (eee->relay_peers != NULL &&
             find_peer_by_mac(eee->relay_peers, peer->mac_addr)) {
             peer = peer->next;
@@ -4347,11 +4362,16 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                     }
                 }
             }
-            /* '*' marks the row that is the current community relay */
+            /* '*' replaces the row number for the current community relay so
+             * all following columns stay aligned (no extra shifting column). */
+            char seq[4];
+            if (memcmp(peer->mac_addr, eee->relay_mac, N2N_MAC_SIZE) == 0)
+                strcpy(seq, " *");
+            else
+                snprintf(seq, sizeof(seq), "%2u", id++);
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %2u%c  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
-                               id++,
-                               (memcmp(peer->mac_addr, eee->relay_mac, N2N_MAC_SIZE) == 0) ? '*' : ' ',
+                               " %s  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               seq,
                                macaddr_str(mac, peer->mac_addr), virt_ip,
                                wan, version, os_name,
                                N2N_NAT_NAME(peer->nat_type));
@@ -4362,7 +4382,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     }
 
     /* Send relay info: shown on the machine acting as a community relay (R);
-     * list the members it currently relays for. */
+     * lists the peers that register to it - every peer it relays for - with
+     * stale entries cleaned up periodically (60s) like a mini SN. Those peers
+     * are excluded from P2P_with above, so nothing is duplicated. */
     if (eee->relay_peers != NULL) {
         msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Relay:\n");
         sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
