@@ -1533,7 +1533,8 @@ static int update_edge( n2n_sn_t * sss,
             }
 
             scan->last_seen = now;
-            return 1;  /* address changed - treat as new for peer push */
+            return 3;  /* known edge whose address changed: the community must
+                          learn the new endpoint (mgmt "n" refresh, CGNAT remap) */
         }
         else
         {
@@ -1546,7 +1547,8 @@ static int update_edge( n2n_sn_t * sss,
 
     scan->last_seen = now;
     return nat_changed ? 2 : 0;  /* 2 = unchanged address but NAT type changed:
-                                     peers need a fresh PEER_INFO push */
+                                    peers need a fresh PEER_INFO push;
+                                    3 = known edge, address changed (see above) */
 }
 
 
@@ -3660,9 +3662,13 @@ static int process_udp( n2n_sn_t * sss,
                      N2N_NAT_FROM_AFLAGS(reg.aflags),
                      use_request_ip, use_requested_ip );
 
-        /* NAT type changed with unchanged address (update_edge == 2):
-         * other edges would never learn it — push the fresh value. */
-        if ( is_new_edge == 2 )
+        /* Edge metadata changed while staying in the table: give the rest of the
+         * community the fresh PEER_INFO. is_new_edge == 2 = NAT type changed
+         * with unchanged address; == 3 = known edge whose address changed
+         * (mgmt "n" refresh, CGNAT re-map). Without this push every peer
+         * keeps pointing at the abandoned endpoint — the SN would show the
+         * edge while nobody can reach it. */
+        if ( is_new_edge == 2 || is_new_edge == 3 )
             push_nat_to_community( sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community );
