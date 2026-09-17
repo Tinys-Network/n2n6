@@ -601,15 +601,17 @@ struct n2n_edge
     uint8_t             nat_type;       /* N2N_NAT_* */
     n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
     n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
-    time_t              nat_probe_time; /* last periodic NAT probe tick */
+    time_t              nat_probe_time; /* last one-shot symmetric check attempt */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
-    uint8_t             nat_bounce_seen;   /* a public helper-port bounce arrived */
+    uint8_t             nat_bounce_seen;   /* a helper-port delivery got through: not port-restricted */
     uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
     uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
     time_t              fc_arm_time;    /* when the stranger window was last (re-)armed:
-                                           an armed window gets its quick NAT re-probe
-                                           12s later instead of waiting for the 300s
-                                           periodic tick */
+                                           the one-shot symmetric check is spent 12s
+                                           later, once the window has served its purpose */
+    uint8_t             nat_sym_tries;  /* attempts spent on the one-shot symmetric check */
+    uint8_t             nat_final;      /* 1: verdict frozen, sn2 is a stranger no more
+                                           (cleared on restart / mapping change only) */
     uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
                                            re-trigger the brother's N2NF probe (mgmt "n") */
     time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured

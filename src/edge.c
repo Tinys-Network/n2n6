@@ -387,12 +387,14 @@ static int edge_init(n2n_edge_t * eee)
     eee->nat_type = N2N_NAT_UNKNOWN;
     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
-    eee->nat_probe_time = n2n_now(); /* anchor to start-of-run, not t=0: a slow startup (DNS, retries) must not let the 300s periodic fire before the mapping is live */
+    eee->nat_probe_time = n2n_now(); /* anchor to start-of-run, not t=0: a slow startup (DNS, retries) must not start the one-shot symmetric check before the mapping is live */
     eee->nat_probe_pending = 0;
     eee->nat_bounce_seen = 0;
     eee->fc_seen = 0;
     eee->fc_window = 1;
-    eee->fc_arm_time = n2n_now(); /* quick probe fires 12s after start; anchoring keeps the stranger window open until the brother's N2NF probes land */
+    eee->fc_arm_time = n2n_now(); /* the one-shot symmetric check fires 12s after start; anchoring keeps the stranger window open until the brother's N2NF probes land */
+    eee->nat_sym_tries = 0;
+    eee->nat_final = 0;
     eee->nat_reprobe = 0;
     eee->sn_query_index = 1;
     eee->sn_backup_index = 1;
@@ -2713,11 +2715,24 @@ static void sn_switch_to( n2n_edge_t * eee, size_t idx )
  * Full cone needs a source the edge NEVER contacted: on each fresh mapping
  * the brother sn (sn2, never contacted until the first query-channel probe)
  * fires a "N2NF" probe at the edge's mapped address; delivered -> full cone.
+ * sn2 can play the stranger only once per mapping generation, so the second
+ * observation (which needs us to contact it) is spent last, as a single
+ * one-shot symmetric check; after it the verdict is frozen until the mapping
+ * changes. Apart from that check the edge never contacts sn2 while sn1 is
+ * healthy (sn2 stays a stranger for the next generation).
  * Observations made by an in-LAN sn (private source address) cannot
  * reveal the NAT mapping; a public bounce still narrows the type down,
  * otherwise the type stays unknown. All observations and probes are
  * IPv4-only by design: IPv6 reflections are ignored (a dual-stack
  * host's family flip must never look like a NAT re-map). */
+/* One-shot symmetric check timing: the stranger window stays open this long
+ * (the brother's N2NF x3 land within the first seconds), then the single
+ * second-observation probe is spent - at most NAT_SYM_MAX_TRIES attempts,
+ * NAT_SYM_RETRY_SECS apart, before the verdict is frozen as measured. */
+#define NAT_STRANGER_SECS   12
+#define NAT_SYM_RETRY_SECS  5
+#define NAT_SYM_MAX_TRIES   3
+
 static int nat_addr_private( const uint8_t * a ) /* network-order IPv4 */
 {
     return ( a[0] == 10 ) ||
@@ -2731,6 +2746,9 @@ static void nat_classify( n2n_edge_t * eee )
     uint8_t new_type;
     int pub1, pub2;
 
+    if ( eee->nat_final )
+        return; /* frozen: the verdict cannot change again in this mapping */
+
     if ( eee->nat_seen_sn1.family != AF_INET &&
          eee->nat_seen_sn2.family != AF_INET )
         return; /* nothing observed yet */
@@ -2740,19 +2758,25 @@ static void nat_classify( n2n_edge_t * eee )
     pub2 = ( eee->nat_seen_sn2.family == AF_INET &&
              !nat_addr_private( eee->nat_seen_sn2.addr.v4 ) );
 
-    if ( eee->fc_seen )
-        /* Strongest evidence: a N2NF probe from the never-contacted brother
-         * crossed the NAT, so the filter admits ANY source -> full cone,
-         * regardless of how the two per-destination mappings differ. */
+    if ( pub1 && pub2 &&
+         ( memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
+           eee->nat_seen_sn1.port != eee->nat_seen_sn2.port ) )
+        /* The two public observations disagree: the mapping is
+         * endpoint-dependent -> symmetric. This is the last word, and it
+         * outranks the N2NF probe on purpose: the probe only shows that the
+         * FILTER is not address-restricted, while the mapping evidence comes
+         * from packets we sent ourselves, out of one socket, in the same
+         * mapping generation. A NAT with endpoint-independent filtering but
+         * endpoint-dependent mapping must not be called full cone: peers
+         * could not reach the address we advertise. */
+        new_type = N2N_NAT_SYMMETRIC;
+    else if ( eee->fc_seen )
+        /* A N2NF probe from the never-contacted brother crossed the NAT, so
+         * the filter admits ANY source -> full cone (mapping agreed above). */
         new_type = N2N_NAT_FULL_CONE;
     else if ( pub1 && pub2 )
     {
-        /* Two public observations: compare the mappings toward two
-         * different destinations. */
-        if ( memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
-             eee->nat_seen_sn1.port != eee->nat_seen_sn2.port )
-            new_type = N2N_NAT_SYMMETRIC;
-        else if ( eee->nat_bounce_seen )
+        if ( eee->nat_bounce_seen )
             new_type = N2N_NAT_RESTRICTED;
         else
             /* Cone confirmed and the helper-port bounce never got through
@@ -2786,7 +2810,7 @@ static void nat_classify( n2n_edge_t * eee )
     new = N2N_NAT_NAME( new_type );
     eee->nat_type = new_type;
 
-    traceEvent( TRACE_NORMAL, "NAT type: %s -> %s", old, new );
+    traceEvent( TRACE_NORMAL, "NAT type (RFC 3489): %s -> %s", old, new );
 
     /* Push the freshly classified NAT type to the SN right away so its
      * relay-eligibility decision (who is qualified to relay for the group)
@@ -2801,13 +2825,44 @@ static void nat_classify( n2n_edge_t * eee )
      * contact with sn2 in the current mapping's lifetime — the very event
      * that closes the full-cone stranger window (fc_window). While the
      * stranger test is still pending (window open), sn2 must stay
-     * untouched so its N2NF probes still prove full cone; it picks up our
-     * type from the periodic QUERY_ONLY probes / failover registrations
-     * anyway. Only once the window is closed is contacting sn2 harmless. */
+     * untouched so its N2NF probes still prove full cone; sn2 picks our
+     * type up from the failover registrations anyway. Only once the window
+     * is closed (the one-shot symmetric check just spent it) is contacting
+     * sn2 harmless. */
     if ( !eee->fc_window &&
          eee->sn_query.family != 0 &&
          memcmp( &eee->sn_query, &eee->supernode, sizeof(eee->sn_query) ) != 0 )
         send_register_super( eee, &(eee->sn_query), 1, 0, NULL );
+}
+
+/* A packet from a helper source port got through: we never used that port
+ * as a destination, so the NAT filter is not port-restricted. Shared by the
+ * sn1 bounce and the sn2 helper-port probe.
+ * A frozen verdict is never re-measured, with one exception: a
+ * port-restricted label written while no helper delivery had ever arrived
+ * said "unproven", not "proven port-restricted" (the bounce packet can
+ * simply have been lost). Re-running the classifier on the evidence already
+ * collected can then only make the verdict more specific, and it sends no
+ * packet. Nothing else can move after the freeze. */
+static void nat_note_helper_port( n2n_edge_t * eee )
+{
+    if ( eee->nat_bounce_seen )
+        return;
+
+    eee->nat_bounce_seen = 1;
+
+    if ( !eee->nat_final )
+    {
+        nat_classify( eee );
+        return;
+    }
+
+    if ( eee->nat_type != N2N_NAT_PORT_RESTRICT )
+        return;
+
+    eee->nat_final = 0;
+    nat_classify( eee );
+    eee->nat_final = 1;
 }
 
 /* Bounce reply from a sn's helper socket arrived. Only public sources
@@ -2824,26 +2879,36 @@ static void handle_nat_bounce( n2n_edge_t * eee, const n2n_sock_t * sender )
            memcmp( sender->addr.v4, eee->sn_query.addr.v4, IPV4_SIZE ) != 0 ) )
         return;
 
-    if ( !eee->nat_bounce_seen )
-    {
-        eee->nat_bounce_seen = 1;
-        nat_classify( eee );
-    }
+    nat_note_helper_port( eee );
 }
 
 /* Full-cone probe ("N2NF", 4 raw bytes) from the sn2 query channel.
- * Counts only while the edge has NEVER sent anything to sn2 in this
- * mapping lifetime (fc_window): sn2 is then a never-contacted source, so
- * delivery proves the NAT filter admits ANY source -> full cone. Public
- * sources only, matched by IP against the sn2 query channel. */
+ * Counts as full cone only while the edge has NEVER sent anything to sn2
+ * in this mapping lifetime (fc_window): sn2's address is then a
+ * never-contacted source, so delivery proves the NAT filter admits ANY
+ * source. After that first contact the same packet proves nothing (a cone
+ * NAT and a port-restricted one both admit our own destination), but a
+ * probe from a source port we never used as a destination still rules out
+ * a port-restricted NAT. That is weak evidence only: it never upgrades the
+ * verdict to full cone and never erases what was measured before.
+ * Public sources only, matched by IP against the sn2 query channel. */
 static void handle_nat_fc( n2n_edge_t * eee, const n2n_sock_t * sender )
 {
-    if ( !eee->fc_window ) return; /* sn2 contacted before: no stranger anymore */
     if ( sender->family != AF_INET || nat_addr_private( sender->addr.v4 ) )
         return;
     if ( eee->sn_query.family != AF_INET ||
          memcmp( sender->addr.v4, eee->sn_query.addr.v4, IPV4_SIZE ) != 0 )
         return;
+
+    if ( !eee->fc_window )
+    {
+        if ( sender->port != eee->sn_query.port && !eee->nat_bounce_seen )
+        {
+            traceEvent( TRACE_INFO, "NAT helper-port probe accepted (not port-restricted)" );
+            nat_note_helper_port( eee );
+        }
+        return;
+    }
 
     if ( !eee->fc_seen )
     {
@@ -2915,33 +2980,49 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         return;
     }
 
-    /* Phase 2.5: NAT type probe (normal mode).
-     * One-shot QUERY_ONLY probe to the sn2 query channel so its ACK echoes
-     * the NAT mapping observed from a second destination (nat_classify).
-     * Skipped while failover/ask_backup is active (Phase 3 probes refresh
-     * nat_seen_sn2 anyway) and when sn_query IS the current supernode
-     * (its registration ACK already provides the second observation).
-     * Two triggers share one action:
-     *   - quick: 12s after fc_arm_time (startup / remap / mgmt "n"
-     *     re-arm it), so a fresh stranger window still has its window open
-     *     while sn2's brother N2NF probes usually land within the first
-     *     seconds;
-     *   - periodic: 300s safety net in case a quick probe got lost.
-     * The armed snapshot is consumed on fire (fc_arm_time = now) so an
-     * armed window probes exactly once, never on every loop tick. */
+    /* Phase 2.5: one-shot symmetric check (normal mode).
+     * The full-cone and bounce verdicts only need sn2 as a stranger, which it
+     * stops being the moment we send anything to it. So the second
+     * observation (one QUERY_ONLY probe whose ACK echoes the mapping seen from
+     * a second destination) is spent exactly once per mapping generation,
+     * NAT_STRANGER_SECS after the window was armed - late enough for the
+     * brother's N2NF x3 to have landed, early enough for the mgmt display to
+     * settle. The verdict is then frozen (nat_final) until the mapping
+     * changes, so the answer never wobbles afterwards; sn2 is left untouched
+     * from here on until sn1 fails. Skipped while failover/ask_backup is
+     * active (those paths contact sn2 anyway) and when sn_query IS the current
+     * supernode (its registration ACK already gives the second observation).
+     * It is also spent only once the first observation (Test I) exists: on a
+     * slow start the single second observation must not be burned before the
+     * edge has seen any mapping at all, or nothing is measured and the
+     * verdict gets frozen at "unknown". */
     if ( eee->sn_num >= 2 && !eee->use_ws && eee->sn_idx == 0 &&
          !eee->sn_ask_backup && !eee->sn_all_failed &&
          eee->sn_query.family != 0 &&
+         eee->nat_seen_sn1.family == AF_INET &&
          sock_equal( &(eee->sn_query), &(eee->supernode) ) != 0 &&
-         ( nowTime > eee->fc_arm_time + 12 ||
-           nowTime > eee->nat_probe_time + 300 ) )
+         !eee->nat_final )
     {
-        eee->nat_probe_time = nowTime;
-        eee->fc_arm_time = nowTime; /* consume the quick-probe snapshot */
-        eee->nat_probe_pending = 1;
-        random_bytes( NULL, eee->sn_probe_cookie, N2N_COOKIE_SIZE );
-        eee->sn_probe_cookie_valid = 1;
-        send_register_super( eee, &(eee->sn_query), 0, 2, NULL );
+        if ( eee->nat_probe_pending &&
+             nowTime > eee->nat_probe_time + NAT_SYM_RETRY_SECS )
+        {
+            eee->nat_probe_pending = 0; /* this attempt timed out */
+            if ( eee->nat_sym_tries >= NAT_SYM_MAX_TRIES )
+            {
+                eee->nat_final = 1; /* sn2 stayed silent: keep what we measured */
+                traceEvent( TRACE_INFO, "NAT symmetric check: sn2 silent, verdict frozen" );
+            }
+        }
+        if ( !eee->nat_probe_pending &&
+             nowTime > eee->fc_arm_time + NAT_STRANGER_SECS )
+        {
+            ++eee->nat_sym_tries;
+            eee->nat_probe_time = nowTime;
+            eee->nat_probe_pending = 1;
+            random_bytes( NULL, eee->sn_probe_cookie, N2N_COOKIE_SIZE );
+            eee->sn_probe_cookie_valid = 1;
+            send_register_super( eee, &(eee->sn_query), 0, 2, NULL );
+        }
     }
 
     /* Phase 3: while on the failover target, every 30s probe for sn1 recovery:
@@ -4163,10 +4244,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             }
             if (eee->local_port != 0) {
                 /* Fixed-port mode: stay on the random port until the probe
-                 * window (bounce + N2NF + quick probe) is done, then the main
-                 * loop rebinds the configured port again. The verdict from
-                 * the random mapping is kept — NAT type is a property of the
-                 * NAT device, not of the port it was probed on. */
+                 * window (bounce + N2NF + one-shot symmetric check) is done,
+                 * then the main loop rebinds the configured port again. The
+                 * verdict from the random mapping is kept — NAT type is a
+                 * property of the NAT device, not of the port it was probed on. */
                 eee->nat_revert_at = n2n_now() + 15;
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                     "> NAT refresh: probing on a fresh random port, fixed port restored in ~15s\n");
@@ -5515,12 +5596,13 @@ process_n2n_packet:
                      0 == memcmp( ra.cookie, eee->sn_probe_cookie,
                                   N2N_COOKIE_SIZE ) )
                 {
-                    /* ACK to a Phase-3 probe or the periodic NAT probe
+                    /* ACK to a Phase-3 probe or the one-shot symmetric check
                      * (shared cookie; told apart by sender). From sn2:
                      * refresh sn1's cached identity only — sn2 answering is
                      * NOT proof sn1 is back. From sn1 itself: failback to
                      * the probed address; afterwards the edge registers
                      * solely with sn1. */
+                    int was_sym_check = eee->nat_probe_pending;
                     eee->nat_probe_pending = 0;
 
                     if ( sock_equal( &sender, &eee->sn_query ) == 0 )
@@ -5531,6 +5613,15 @@ process_n2n_packet:
                         {
                             eee->nat_seen_sn2 = ra.sock;
                             nat_classify( eee );
+                            if ( was_sym_check )
+                            {
+                                /* The single second observation is spent: sn2
+                                 * is no longer a stranger, so nothing can be
+                                 * re-measured in this mapping generation. */
+                                eee->nat_final = 1;
+                                traceEvent( TRACE_INFO, "NAT verdict frozen as %s",
+                                            N2N_NAT_NAME( eee->nat_type ) );
+                            }
                         }
 
                         /* sn2 answered the probe: it is alive. Keep last_sup
@@ -5873,14 +5964,13 @@ process_n2n_packet:
                                     eee->nat_bounce_seen = 0;
                                     eee->fc_seen = 0;
                                     eee->fc_window = 1;
-                                    /* Defer the QUERY_ONLY sn2 probe: if the
-                                     * 300s timer happened to fire right at the
-                                     * remap, that first-contact packet would slam
-                                     * the fresh stranger window shut before the
-                                     * brother's N2NF probes land. fc_arm_time
-                                     * instead schedules one quick probe 12s out
-                                     * (fast symmetric/port-restrict verdict
-                                     * without stealing the brother's window). */
+                                    eee->nat_sym_tries = 0;
+                                    eee->nat_final = 0;
+                                    /* The one-shot symmetric check is scheduled
+                                     * NAT_STRANGER_SECS out instead of firing
+                                     * right here: a first-contact packet now
+                                     * would slam the fresh stranger window shut
+                                     * before the brother's N2NF probes land. */
                                     eee->nat_probe_time = now;
                                     eee->fc_arm_time = now;
                                 }
@@ -5892,8 +5982,7 @@ process_n2n_packet:
                              * The suppressed restoral ACK is skipped entirely:
                              * its fixed-mapping echo must not mix with the
                              * random-mapping observations (that would look like
-                             * a symmetric NAT). Fresh observations are
-                             * re-collected by the re-armed quick probe. */
+                             * a symmetric NAT). */
                             if ( !suppress_ack )
                             {
                                 if ( sock_equal( &sender, &eee->sn_query ) == 0 )
@@ -7611,9 +7700,11 @@ static int run_loop(n2n_edge_t * eee )
             memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
             memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
             eee->nat_bounce_seen = 0;
-            /* Re-collect observations quickly (12s) so sn1/sn2 agree again. */
-            eee->nat_probe_time = n2n_now();
-            eee->fc_arm_time = n2n_now();
+            /* Freeze that verdict for good: the restored fixed port may still
+             * hold a live sn2 mapping from an earlier run, so re-measuring
+             * here is exactly the case that produces a bogus full cone. */
+            eee->nat_final = 1;
+            eee->nat_probe_pending = 0;
             eee->nat_suppress_remap = 1; /* first ACK updates my_public_sock only, keeps the verdict */
             if (setup_sockets(eee, (int)eee->local_port) < 0)
                 traceEvent(TRACE_ERROR, "NAT refresh: rebind to fixed port %u failed",
