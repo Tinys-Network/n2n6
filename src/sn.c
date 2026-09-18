@@ -26,6 +26,10 @@ static int resolve_brother_addr(const char *text, n2n_sock_t *out);
 static void send_brother_reg(struct n2n_sn *sss, time_t now);
 static size_t brother_list_format(struct n2n_sn *sss, time_t now, char *buf, size_t bufsz);
 
+/* Resolve our [-b] little-brother address (sn2) with caching.
+ * Returns 0 on success, -1 if -b is unconfigured or resolution failed. */
+static int resolve_my_brother_addr( struct n2n_sn *sss, n2n_sock_t *out, time_t now );
+
 /* Build an n2n_sock_t from a recvfrom() sockaddr (family 0 if unsupported). */
 static int sock_from_sender( n2n_sock_t *out, const struct sockaddr *sa )
 {
@@ -729,6 +733,9 @@ struct n2n_sn
     int                    backup_token_set;
     struct promoted_peer   promoted[PROMOTED_LIST_MAX]; /* ask-backup-verified sn1 edges */
     char                   backup_addr_text[256]; /* sn2 address (sn1 given via -b) */
+    n2n_sock_t             backup_resolved;     /* cached resolution of backup_addr_text */
+    int                    backup_resolved_valid; /* 1 once resolved successfully */
+    time_t                 backup_resolved_time;  /* when the cache was filled */
     time_t                 last_brother_seen;
     n2n_mac_t              device_mac;       /* local NIC MAC used as SN identity in brother_reg */
     /* Deferred full-cone probes: N2NF #1 fires on FCP arrival, #2/#3 are
@@ -2318,8 +2325,11 @@ static int try_broadcast( n2n_sn_t * sss,
  * source port the edge never uses as a destination): that one still rules
  * out a port-restricted NAT after the edge has contacted the channel. */
 
-/* Fire the probe at a forwarded edge mapping. Sender must match a live
- * brother entry (IP level) so only the paired SN can trigger it. */
+/* Fire the probe at a forwarded edge mapping. Sender must be a live BIG
+ * brother entry (ROLE_MY_BIG): big brothers registered me as their [-b]
+ * little brother, so when they forward one of their own children I adopt
+ * and probe it. My little brother, strangers and (to keep the hierarchy)
+ * any non-brother are never accepted here. */
 static void handle_fc_probe_request( n2n_sn_t *sss,
                                      const struct sockaddr *sender_sock,
                                      const uint8_t *udp_buf,
@@ -2344,6 +2354,9 @@ static void handle_fc_probe_request( n2n_sn_t *sss,
         {
             n2n_brother_entry_t *b = &sss->brothers[j];
             if ( memcmp( b->mac, zero, 6 ) == 0 ) continue;
+            /* Only big brothers may ask me to probe their children.
+             * My little brother's edges are none of my business. */
+            if ( b->role == N2N_BROTHER_ROLE_MY_LITTLE ) continue;
             if ( b->sock.family == AF_INET &&
                  memcmp( b->sock.addr.v4, sender_n2n.addr.v4, IPV4_SIZE ) == 0 )
                 from_brother = 1;
@@ -2408,9 +2421,10 @@ static void fc_probes_tick( n2n_sn_t * sss, time_t now )
     }
 }
 
-/* Forward a brand-new edge mapping to the brother SN(s) so THEY can act
- * as the never-contacted source. Targets: live brothers[] entries first,
- * fallback to the resolved -b address (asymmetric -b configs). */
+/* Forward a brand-new edge mapping to our [-b] little brother (sn2) so IT
+ * can act as the never-contacted source for a full-cone probe. Big brothers
+ * and strangers are never asked: only my little brother adopts my edges
+ * (handles their own children through the fc-probe flow on themselves). */
 static void send_fc_probe_request( n2n_sn_t *sss,
                                    const n2n_mac_t edgeMac,
                                    const n2n_sock_t *edge_sock,
@@ -2427,20 +2441,24 @@ static void send_fc_probe_request( n2n_sn_t *sss,
     pkt[14] = ( edge_sock->port >> 8 ) & 0xFF;
     pkt[15] = edge_sock->port & 0xFF;
 
+    /* Only entries flagged as my little brother (sn2) are asked. */
     for ( int j = 0; j < MAX_BROTHER_SNS; j++ )
     {
         n2n_brother_entry_t *b = &sss->brothers[j];
         time_t seen = b->seen > b->seen6 ? b->seen : b->seen6;
-        if ( b->sock.family == AF_INET && seen != 0 && now - seen <= 180 )
+        if ( b->role == N2N_BROTHER_ROLE_MY_LITTLE &&
+             b->sock.family == AF_INET && seen != 0 && now - seen <= 180 )
         {
             sendto_sock( sss, &b->sock, pkt, sizeof(pkt) );
             sent = 1;
         }
     }
+    /* Fallback: brother table has no live little brother (or it registered
+     * only on IPv6) — use our [-b] address directly. */
     if ( !sent && sss->backup_addr_text[0] != '\0' )
     {
         n2n_sock_t bs;
-        if ( resolve_brother_addr( sss->backup_addr_text, &bs ) == 0 &&
+        if ( resolve_my_brother_addr( sss, &bs, now ) == 0 &&
              bs.family == AF_INET )
         {
             sendto_sock( sss, &bs, pkt, sizeof(pkt) );
@@ -3422,6 +3440,40 @@ static int process_udp( n2n_sn_t * sss,
             }
             sss->last_brother_seen = now;
 
+            /* Determine relationship direction: compare sender against our
+             * [-b] (sn2) address. If the sender IS our configured [-b]
+             * partner (circular -b: sn1↔sn2 both set each other), the
+             * sender is our little brother and goes into the slot with
+             * ROLE_MY_LITTLE. Otherwise the sender registered us as
+             * *their* [-b] and is our big brother (ROLE_MY_BIG). */
+            {
+                n2n_sock_t backup_addr;
+                if ( resolve_my_brother_addr( sss, &backup_addr, now ) == 0 &&
+                     sender_n2n.family == backup_addr.family )
+                {
+                    int addr_match = 0;
+                    if ( sender_n2n.family == AF_INET &&
+                         memcmp( sender_n2n.addr.v4, backup_addr.addr.v4, IPV4_SIZE ) == 0 &&
+                         sender_n2n.port == backup_addr.port )
+                        addr_match = 1;
+                    else if ( sender_n2n.family == AF_INET6 &&
+                              memcmp( sender_n2n.addr.v6, backup_addr.addr.v6, IPV6_SIZE ) == 0 &&
+                              sender_n2n.port == backup_addr.port )
+                        addr_match = 1;
+
+                    if ( addr_match )
+                    {
+                        be->role = N2N_BROTHER_ROLE_MY_LITTLE;
+                        traceEvent(TRACE_INFO, "Brother slot %d = my little brother (sn2): %s",
+                                   slot, sock_to_cstr(sockbuf, &sender_n2n));
+                    }
+                }
+                if ( be->role != N2N_BROTHER_ROLE_MY_LITTLE )
+                {
+                    be->role = N2N_BROTHER_ROLE_MY_BIG;
+                }
+            }
+
             /* Refresh IPv6 entry from reg.own_ipv6 whenever sn1 provides one.
              * The own_ipv6 GUA is what sn1 currently uses for incoming IPv6
              * traffic, so its port follows sn1's -l value. Update every
@@ -3694,11 +3746,15 @@ static int process_udp( n2n_sn_t * sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community );
 
-        /* Brand-new (or re-mapped) edge — or an edge that explicitly asked for a
-         * manual NAT re-probe (mgmt "n", N2N_AFLAGS_NAT_REPROBE): one-shot
+        /* Brand-new edge (update_edge == 1) or known edge whose public address
+         * changed (== 3: its NAT mapping was recreated, so the stranger window
+         * is open again) — or an edge that explicitly asked for a manual NAT
+         * re-probe (mgmt "n" / edge restart, N2N_AFLAGS_NAT_REPROBE): one-shot
          * chance for the brother SN to full-cone-probe it as a
-         * never-contacted source. */
-        if ( is_new_edge || (reg.aflags & N2N_AFLAGS_NAT_REPROBE) )
+         * never-contacted source. (is_new_edge == 2, NAT type changed with an
+         * unchanged address, does NOT re-probe: the mapping never changed, so
+         * an out-of-window probe would buy nothing.) */
+        if ( is_new_edge == 1 || is_new_edge == 3 || (reg.aflags & N2N_AFLAGS_NAT_REPROBE) )
             send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
 
         /* Remember the edge's relay stance so find_community_relay can prefer
@@ -4454,21 +4510,10 @@ static void send_brother_reg(n2n_sn_t *sss, time_t now)
 
     if (sss->backup_addr_text[0] == '\0') return;
 
-    /* Resolve and cache the sn2 address inside this process. */
-    static n2n_sock_t  cached_sock = {0};
-    static int        cached_resolved = 0;
-    static time_t     cached_time = 0;
-
-    if (!cached_resolved || (now - cached_time > 300)) {
-        cached_resolved = 0;
-        memset(&cached_sock, 0, sizeof(cached_sock));
-        if (resolve_brother_addr(sss->backup_addr_text, &cached_sock) == 0) {
-            cached_resolved = 1;
-            cached_time = now;
-        }
-    }
-    if (!cached_resolved) return;
-    backup_sock = cached_sock;
+    /* Resolve and cache the sn2 address (shared cache used by the
+     * brother_reg direction check in the packet handler). */
+    if ( resolve_my_brother_addr( sss, &backup_sock, now ) != 0 )
+        return;
 
     /* Prefer the live NIC MAC. Skip registration entirely if neither NIC
      * MAC nor fallback is available so the partner SN never sees a
@@ -4553,5 +4598,33 @@ static int resolve_brother_addr(const char *text, n2n_sock_t *out)
     }
     out->port = port;
     freeaddrinfo(res);
+    return 0;
+}
+
+/* resolve_my_brother_addr: resolve our [-b] little-brother (sn2) address
+ * with a 300-second cache so the brother_reg handler can compare a sender's
+ * IP against the resolved sn2 address without calling getaddrinfo() every
+ * heartbeat. Returns 0 on success, -1 if -b is unconfigured or resolution
+ * failed. */
+static int resolve_my_brother_addr( n2n_sn_t *sss, n2n_sock_t *out, time_t now )
+{
+    if ( sss->backup_addr_text[0] == '\0' )
+        return -1;
+
+    if ( !sss->backup_resolved_valid || (now - sss->backup_resolved_time > 300) )
+    {
+        memset( &sss->backup_resolved, 0, sizeof(sss->backup_resolved) );
+        if ( resolve_brother_addr( sss->backup_addr_text, &sss->backup_resolved ) == 0 )
+        {
+            sss->backup_resolved_valid = 1;
+            sss->backup_resolved_time  = now;
+        }
+        else
+        {
+            sss->backup_resolved_valid = 0;
+        }
+    }
+    if ( !sss->backup_resolved_valid ) return -1;
+    *out = sss->backup_resolved;
     return 0;
 }
