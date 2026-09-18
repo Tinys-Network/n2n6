@@ -377,6 +377,7 @@ static int edge_init(n2n_edge_t * eee)
     eee->sn_ask_backup = 0;
     memset(eee->sn1_current_addr, 0, sizeof(eee->sn1_current_addr));
     memset(eee->sn1_mac, 0, sizeof(eee->sn1_mac));
+    memset(&eee->sn1_v4, 0, sizeof(eee->sn1_v4));
     memset(&eee->sn1_v6, 0, sizeof(eee->sn1_v6));
     memset(eee->sn_ack_backup, 0, sizeof(eee->sn_ack_backup));
     eee->sn_ak_parsed = 0;
@@ -1327,11 +1328,16 @@ static void cache_sn1_addr( n2n_edge_t * eee,
     {
         snprintf( eee->sn1_current_addr,
                   sizeof(eee->sn1_current_addr), "%s", addr_buf );
-        if ( bin->family == AF_INET &&
-             strncmp( eee->sn_ip_array[0], addr_buf,
-                      sizeof(eee->sn_ip_array[0]) ) != 0 )
-            snprintf( eee->sn_ip_array[0],
-                      sizeof(eee->sn_ip_array[0]), "%s", addr_buf );
+        if ( bin->family == AF_INET )
+        {
+            /* Keep the display copy of sn1's real v4 in sync (ask_backup
+             * brother match), so -Q shows the true address after failover. */
+            eee->sn1_v4 = *bin;
+            if ( strncmp( eee->sn_ip_array[0], addr_buf,
+                          sizeof(eee->sn_ip_array[0]) ) != 0 )
+                snprintf( eee->sn_ip_array[0],
+                          sizeof(eee->sn_ip_array[0]), "%s", addr_buf );
+        }
     }
 }
 
@@ -4560,12 +4566,20 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             /* ACK-learned brother: show the masked display copy instead */
             if ( sn_is_ack_brother(eee, sn_i) && eee->sn_bak_masked[0] )
                 sn_host = eee->sn_bak_masked;
+            /* SN1 row: prefer the resolved/learnt real IPv4 over the -l
+             * hostname, so -Q shows the address actually in use. */
+            n2n_sock_str_t v4buf;
+            if ( sn_i == 0 && eee->sn1_v4.family == AF_INET )
+                sn_host = sock_to_cstr( v4buf, &eee->sn1_v4 );
             char host[N2N_SOCKBUF_SIZE + 1] = "";
             if (sn_i == 0 && eee->sn1_v6.family == AF_INET6)
             {
                 n2n_sock_str_t v6buf;
                 const char *v6s = sock_to_cstr(v6buf, &eee->sn1_v6); /* "[...]:port" */
-                if (strlen(sn_host) + 1 + strlen(v6s) <= 50)
+                /* Column is 49 chars wide (%-49.49s below): budget the full
+                 * v4/v6 string against 49, not 50, or the trailing port
+                 * digit gets truncated by the print width. */
+                if (strlen(sn_host) + 1 + strlen(v6s) <= 49)
                 {
                     snprintf(host, sizeof(host), "%s/%s", sn_host, v6s);
                 }
@@ -4578,8 +4592,8 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                     size_t addr_len = 0;
                     while (v6s[1 + addr_len] && v6s[1 + addr_len] != ']') addr_len++;
                     size_t tail = 1 /* / */ + 1 /* [ */ + 2 /* ] : */ + port_len;
-                    size_t avail = (strlen(sn_host) + tail < 50)
-                             ? 50 - strlen(sn_host) - tail : 1;
+                    size_t avail = (strlen(sn_host) + tail < 49)
+                             ? 49 - strlen(sn_host) - tail : 1;
                     size_t keep = (avail >= 1) ? avail - 1 : 0;  /* room for '*' */
                     if (keep > addr_len) keep = addr_len;
                     size_t off = strlen(sn_host);
@@ -5631,8 +5645,11 @@ process_n2n_packet:
                         eee->last_sup = now;
                         if ( ra.sn_bak.family != 0 )
                         {
-                            cache_sn1_addr( eee, ra.sn_bak_str, ra.sn_bak_str_len,
-                                            &ra.sn_bak );
+                            /* sn_bak_str is the ANSWERING sn's own -b text,
+                             * not an sn1 address: never let it rewrite
+                             * sn_ip_array[0]. Only the brother-matched sock
+                             * (ra.sn_bak) is a genuine sn1 address. */
+                            cache_sn1_addr( eee, NULL, 0, &ra.sn_bak );
                             if ( mac_nonzero( ra.sn1_mac ) )
                                 memcpy( eee->sn1_mac, ra.sn1_mac, N2N_MAC_SIZE );
                             if ( ra.sn_bak_v6.family == AF_INET6 )
@@ -5722,8 +5739,10 @@ process_n2n_packet:
                                 eee->sn_idx = 0;
                                 eee->sn_ask_backup = 0;
                                 eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
-                                cache_sn1_addr( eee, ra.sn_bak_str,
-                                                ra.sn_bak_str_len, &ra.sn_bak );
+                                /* sn_bak_str is the answering sn's own -b
+                                 * text, not an sn1 address: use the brother-
+                                 * matched binary sock instead. */
+                                cache_sn1_addr( eee, NULL, 0, &ra.sn_bak );
                                 sock_to_cstr( sockbuf1, &ra.sn_bak );
                                 if ( strcmp(eee->sn1_current_addr, sockbuf1) == 0 )
                                     traceEvent(TRACE_WARNING,
@@ -7382,6 +7401,11 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         sleep(5);
 #endif
     }
+
+    /* Remember sn1's resolved v4 so -Q shows the real address (not the
+     * -l hostname) from startup, before any ask_backup has happened. */
+    if ( eee.supernode.family == AF_INET )
+        eee.sn1_v4 = eee.supernode;
 
     /* Failover target: the user-configured second -l, when present. The query
      * channel stays on the sn1-official backup (index 1 once the sn1 ACK
