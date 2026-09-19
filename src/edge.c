@@ -5300,6 +5300,12 @@ process_n2n_packet:
              * edge carries no eligibility judgment of its own -- the SN decides
              * who qualifies (NAT1/2, public, willing). */
             if (pi.aflags & N2N_AFLAGS_RELAY) {
+                /* WS mode carries the SN conversation over the WebSocket, but a
+                 * community relay is pure UDP (register to it, send data to it,
+                 * receive forwarded frames from it). WS mode is chosen exactly
+                 * when UDP is not usable, so ignore relay assignments
+                 * completely: we neither become a relay nor register to one. */
+                if (eee->use_ws) return 1;
                 if (memcmp(pi.mac, eee->device.mac_addr, N2N_MAC_SIZE) == 0) {
                     eee->relay_mode = 1; /* we are the designated relay */
                     /* The SN names our own MAC: this is our relay assignment,
