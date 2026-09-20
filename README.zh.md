@@ -88,6 +88,13 @@ sudo make install
 - 手册页：`doc/edge.8`、`doc/supernode.1`、`doc/n2n_v2.7`
 - 更新日志：`NEW_FEATURES.md`
 
+### 交流群
+
+对 n2n6 有任何问题均可以加群联系作者。
+
+- QQ 群 1：256572040（满员）
+- QQ 群 2：196588661
+
 ### 相关项目
 
 - [mxre/n2n](https://github.com/mxre/n2n) - 上游项目

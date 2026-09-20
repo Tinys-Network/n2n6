@@ -88,6 +88,13 @@ sudo make install
 - Man pages: `doc/edge.8`, `doc/supernode.1`, `doc/n2n_v2.7`
 - Changelog: `NEW_FEATURES.md`
 
+### Community
+
+If you have any questions about n2n6, feel free to join the QQ groups to contact the author.
+
+- QQ Group 1: 256572040 (full)
+- QQ Group 2: 196588661
+
 ### Related
 
 - [mxre/n2n](https://github.com/mxre/n2n) - Upstream
