@@ -5984,8 +5984,18 @@ process_n2n_packet:
                             if (old_pub.family != 0 &&
                                 sock_equal(&old_pub, &eee->my_public_sock) != 0)
                             {
-                                traceEvent(TRACE_NORMAL, "Our public address changed to %s",
+                                /* Under CGNAT the public port churns on every new
+                                 * mapping; only a public IP change is worth a
+                                 * NORMAL line, port-only changes go to INFO. */
+                                int ip_changed = (old_pub.family != eee->my_public_sock.family) ||
+                                                 (old_pub.family == AF_INET &&
+                                                  memcmp(old_pub.addr.v4,
+                                                         eee->my_public_sock.addr.v4,
+                                                         IPV4_SIZE) != 0);
+                                traceEvent(ip_changed ? TRACE_NORMAL : TRACE_INFO,
+                                           "Our public address changed to %s",
                                            sock_to_cstr(sockbuf1, &eee->my_public_sock));
+
                                 if (eee->nat_suppress_remap) {
                                     /* This remap is the fixed-port restore of an
                                      * "n" refresh: classification already ran on
@@ -7661,7 +7671,12 @@ static void edge_ws_connect(n2n_edge_t *eee) {
     ws_init(&eee->ws_conn);
     eee->ws_conn.is_client = 1; /* edge side: send with mask */
     if (ws_connect(&eee->ws_conn, ws_host, host_header, ws_port) == 0) {
-        traceEvent(TRACE_NORMAL, "WS connected to %s:%u", ws_host, ws_port);
+        /* First connection at NORMAL, reconnects at INFO so a flapping link
+         * does not flood the console. */
+        if (eee->ws_last_reconnect == 0)
+            traceEvent(TRACE_NORMAL, "WS connected to %s:%u", ws_host, ws_port);
+        else
+            traceEvent(TRACE_INFO, "WS reconnected to %s:%u", ws_host, ws_port);
     } else {
         traceEvent(TRACE_INFO, "WS connect to %s:%u failed (will retry)", ws_host, ws_port);
         eee->ws_last_reconnect = n2n_now();

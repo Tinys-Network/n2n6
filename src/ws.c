@@ -64,10 +64,23 @@ static void ws_set_block(SOCKET fd) {
 #endif
 }
 
-static void ws_set_timeo(SOCKET fd, int sec) {
-    struct timeval tv; tv.tv_sec = sec; tv.tv_usec = 0;
+/* Set SO_RCVTIMEO / SO_SNDTIMEO. Windows expects a DWORD in milliseconds,
+ * not a struct timeval: passing a timeval makes Winsock read tv_sec as
+ * milliseconds (5s becomes 5ms), so the handshake times out instantly. */
+static void ws_set_timeo(SOCKET fd, int rcv_sec, int snd_sec) {
+#ifdef _WIN32
+    DWORD ms;
+    ms = (DWORD)rcv_sec * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof(ms));
+    ms = (DWORD)snd_sec * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof(ms));
+#else
+    struct timeval tv;
+    tv.tv_sec = rcv_sec; tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    tv.tv_sec = snd_sec; tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+#endif
 }
 
 /* Aggressive TCP keepalive: prevent NAT timeout (idle 10s probe, 5s interval,
@@ -485,7 +498,7 @@ int ws_connect(ws_conn_t *c, const char *host, const char *host_header, uint16_t
     c->fd = fd;
     /* Handshake phase: blocking + 5 second timeout */
     ws_set_block(fd);
-    ws_set_timeo(fd, 5);
+    ws_set_timeo(fd, 5, 5);
 
     if (ws_client_handshake(fd, host, host_header, port, c) < 0) {
         traceEvent(TRACE_WARNING, "ws_connect: WS handshake to %s:%u failed", host, (unsigned)port);
@@ -496,13 +509,7 @@ int ws_connect(ws_conn_t *c, const char *host, const char *host_header, uint16_t
     /* Data phase: receive timeout 2s; send timeout 3s — ws_send_all blocks but
      * bounded: a full TCP window makes room (smooth throttling), a dead peer
      * triggers EAGAIN after 3s so the main loop never freezes. */
-    {
-        struct timeval tv;
-        tv.tv_sec = 2; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        tv.tv_sec = 3; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-    }
+    ws_set_timeo(fd, 2, 3);
     /* TCP keepalive + TCP_NODELAY */
     ws_set_keepalive(fd);
 
@@ -525,7 +532,7 @@ int ws_server_accept(ws_conn_t *c, SOCKET listen_fd) {
 
     c->fd = fd;
     ws_set_block(fd);
-    ws_set_timeo(fd, 5);
+    ws_set_timeo(fd, 5, 5);
 
     if (ws_server_handshake(fd, c) < 0) {
         ws_close(c);
@@ -533,13 +540,7 @@ int ws_server_accept(ws_conn_t *c, SOCKET listen_fd) {
     }
 
     /* Data phase: receive timeout 2s; send timeout 3s (same as ws_connect) + keepalive */
-    {
-        struct timeval tv;
-        tv.tv_sec = 2; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        tv.tv_sec = 3; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-    }
+    ws_set_timeo(fd, 2, 3);
     ws_set_keepalive(fd);
 
     c->state = WS_OPEN;
@@ -770,6 +771,7 @@ needmore:
          * to wait for next select */
         {
             ssize_t r;
+            int     recv_err = 0;   /* error code captured right after recv() */
             if (c->rx_len >= sizeof(c->rx_buf)) {
                 /* Buffer full but still cannot decode frame: protocol anomaly */
                 ws_close(c);
@@ -781,25 +783,34 @@ needmore:
                 ioctlsocket(c->fd, FIONBIO, &nb);
                 r = recv(c->fd, (char*)c->rx_buf + c->rx_len,
                          sizeof(c->rx_buf) - c->rx_len, 0);
+                /* Capture the error before restoring blocking mode: on Windows
+                 * a successful Winsock call resets the thread's last-error, so
+                 * the ioctlsocket below would wipe WSAEWOULDBLOCK and turn a
+                 * routine "no data yet" into a fatal close. */
+                if (r < 0) recv_err = WSAGetLastError();
                 nb = 0;
                 ioctlsocket(c->fd, FIONBIO, &nb);
             }
 #else
             r = recv(c->fd, (char*)c->rx_buf + c->rx_len,
                      sizeof(c->rx_buf) - c->rx_len, MSG_DONTWAIT);
+            if (r < 0) recv_err = errno;
 #endif
             if (r > 0) {
                 c->rx_len += (size_t)r;
                 continue;
             }
-            if (r == 0) { ws_close(c); return -1; }  /* Peer closed */
-            {
-                int err = WS_ERRNO();
-                if (err == WS_EINTR) continue;
-                if (err == WS_EAGAIN || err == WS_ETIMEOUT) return 0;
+            if (r == 0) {
+                /* Peer sent FIN: the remote end closed the TCP connection. */
+                traceEvent(TRACE_WARNING, "WS recv: peer closed the connection");
                 ws_close(c);
                 return -1;
             }
+            if (recv_err == WS_EINTR) continue;
+            if (recv_err == WS_EAGAIN || recv_err == WS_ETIMEOUT) return 0;
+            traceEvent(TRACE_WARNING, "WS recv: socket error %d, closing", recv_err);
+            ws_close(c);
+            return -1;
         }
     }
 }
