@@ -800,6 +800,7 @@ static void help() {
     printf("or: edge -a <tun IP address> -c <community> -k <encrypt key> -A <mode> -l <supernode host:port>\n");
     printf("\n");
 
+    printf("[config_file]            | Parameter file, one option per line ('#' comments).\n" );
     printf("-a <addr>[/<prefixlen>]  | Set interface IP address (IPv4 or IPv6, auto-detected).\n");
     printf("                         : for DHCP use '-r -a dhcp:0.0.0.0/0'\n");
     printf("                         : if not specified, auto-assigns 10.64.0.x from supernode.\n");
