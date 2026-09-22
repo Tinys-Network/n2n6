@@ -385,6 +385,7 @@ static int edge_init(n2n_edge_t * eee)
     memset(&eee->sn_query, 0, sizeof(n2n_sock_t));
     memset(&eee->sn1_probe_addr, 0, sizeof(n2n_sock_t));
     eee->sn_probe_cookie_valid = 0;
+    eee->last_failover_dns = 0;
     eee->nat_type = N2N_NAT_UNKNOWN;
     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
@@ -1322,6 +1323,13 @@ static void cache_sn1_addr( n2n_edge_t * eee,
                             const char *str, uint16_t str_len,
                             const n2n_sock_t *bin )
 {
+    /* sn1 configured as a literal IP: the -l parameter is the most
+     * authoritative. sn2's brother table may hold an unreachable NATed
+     * address (the public IP:port sn2 saw), which would poison every later
+     * probe - never let it overwrite the cache. */
+    if ( !eee->re_resolve_supernode_ip )
+        return;
+
     char addr_buf[N2N_SOCKBUF_SIZE];
     memset(addr_buf, 0, sizeof(addr_buf));
     if ( str_len > 0 && str_len < sizeof(addr_buf) )
@@ -3030,16 +3038,28 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
          nowTime > eee->last_register_req + 300 )
     {
         eee->sn_all_failed = 0;
-        eee->sn_ask_backup = 1;
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
-        send_register_super( eee, &(eee->sn_query), 1, 0, NULL );
-        send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+        if ( eee->re_resolve_supernode_ip )
+        {
+            eee->sn_ask_backup = 1;
+            send_register_super( eee, &(eee->sn_query), 1, 0, NULL );
+            send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+            traceEvent(TRACE_WARNING, "sn_all_failed cooldown: re-probing sn2 (%s)",
+                       sn_is_ack_brother( eee, eee->sn_query_index )
+                       ? eee->sn_bak_masked
+                       : sock_to_cstr(sockbuf, &eee->sn_query));
+        }
+        else
+        {
+            /* sn1 is a literal IP: the configured address is authoritative,
+             * nothing to look up - go straight to the failover target. */
+            sn_switch_to( eee, eee->sn_backup_index );
+            send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+            traceEvent(TRACE_WARNING, "sn_all_failed cooldown: literal sn1 IP - switching directly to sn%u",
+                       (unsigned int)(eee->sn_backup_index + 1));
+        }
         eee->sn_wait = 1;
         eee->last_register_req = nowTime;
-        traceEvent(TRACE_WARNING, "sn_all_failed cooldown: re-probing sn2 (%s)",
-                   sn_is_ack_brother( eee, eee->sn_query_index )
-                   ? eee->sn_bak_masked
-                   : sock_to_cstr(sockbuf, &eee->sn_query));
         return;
     }
 
@@ -3129,22 +3149,49 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
     {
         eee->last_primary_probe = nowTime;
 
-        n2n_sock_t sn1addr;
-        memset(&sn1addr, 0, sizeof(sn1addr));
-        if ( eee->sn1_current_addr[0] )
-            supernode2addr( &sn1addr, eee->sn_af, eee->sn1_current_addr );
-        if ( sn1addr.family == 0 )
-            supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
-
-        /* 1) ask the sn2 query channel for sn1's current address (updates
-         *    sn1_current_addr). Always sent — even when the query channel IS
-         *    the current failover target, this is what lets us follow a
-         *    port/IP change on sn1 and fail back.
-         * 2) probe sn1 directly; only its own ACK triggers failback. */
+        /* Fresh cookie for this tick's probes (both branches below). */
         random_bytes(NULL, eee->sn_probe_cookie, N2N_COOKIE_SIZE);
         eee->sn_probe_cookie_valid = 1;
-        send_register_super( eee, &(eee->sn_query), 0, 2, &sn1addr );
 
+        n2n_sock_t sn1addr;
+        memset(&sn1addr, 0, sizeof(sn1addr));
+
+        if ( !eee->re_resolve_supernode_ip )
+        {
+            /* sn1 is a literal IP: the -l parameter is the most authoritative
+             * (sn2's brother table may hold an unreachable NATed public
+             * address). Drop any sn2-learned value, skip the sn2 lookup
+             * entirely and just heartbeat the original address — sn1's own
+             * ACK to this probe is what triggers failback. */
+            eee->sn1_current_addr[0] = '\0';
+            supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
+        }
+        else
+        {
+            /* The sn1 cache was last written from sn2's ask_backup answer (a
+             * binary IP text), so the -l domain would never be looked at again.
+             * Every ~5 min drop the cache; the existing resolution below then
+             * falls back to sn_ip_array[0] (the original -l domain), and this
+             * round's sn2 reply re-caches whatever is freshest. */
+            if ( nowTime > eee->last_failover_dns + 300 )
+            {
+                eee->last_failover_dns = nowTime;
+                eee->sn1_current_addr[0] = '\0';
+            }
+
+            if ( eee->sn1_current_addr[0] )
+                supernode2addr( &sn1addr, eee->sn_af, eee->sn1_current_addr );
+            if ( sn1addr.family == 0 )
+                supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
+
+            /* ask the sn2 query channel for sn1's current address (updates
+             * sn1_current_addr). Always sent — even when the query channel IS
+             * the current failover target, this is what lets us follow a
+             * port/IP change on sn1 and fail back. */
+            send_register_super( eee, &(eee->sn_query), 0, 2, &sn1addr );
+        }
+
+        /* heartbeat sn1 directly; only its own ACK triggers failback. */
         if ( sn1addr.family != 0 )
         {
             eee->sn1_probe_addr = sn1addr;
@@ -3177,7 +3224,12 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
     {
         if ( eee->sn_idx == 0 && eee->sn_num >= 2 )
         {
-            if ( eee->sn1_ever_ok )
+            /* sn1 is a domain: ask sn2 for its newest address first — it may
+             * have moved and be reachable at a new one. sn1 configured as a
+             * literal IP falls through with the never-up case: the -l
+             * parameter is authoritative (sn2 may only know an unreachable
+             * NATed address), so there is nothing to look up. */
+            if ( eee->sn1_ever_ok && eee->re_resolve_supernode_ip )
             {
                 /* sn1 worked before but now is silent: it may have changed
                  * address — ask sn2 so we can reconnect to the new one. */
@@ -3197,8 +3249,9 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             else
             {
                 /* sn1 was never up (bad token / wrong port / offline since
-                 * start): there is no earlier address to rediscover, so skip
-                 * the sn2 lookup and go straight to the failover target. */
+                 * start), or sn1 is a literal IP: no earlier address to
+                 * rediscover, so skip the sn2 lookup and go straight to the
+                 * failover target. */
                 traceEvent(TRACE_WARNING,
                            "sn1 not responding - switching directly to sn%u",
                            (unsigned int)(eee->sn_backup_index + 1));
