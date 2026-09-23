@@ -399,6 +399,8 @@ static int edge_init(n2n_edge_t * eee)
     eee->nat_final = 0;
     eee->nat_reprobe = 0;
     eee->nat_autorecover_at = 0;
+    eee->nat_refresh_start = 0;
+    eee->nat_rebuild_tries = 0;
     eee->sn_query_index = 1;
     eee->sn_backup_index = 1;
     eee->sn_af = AF_UNSPEC;
@@ -2748,6 +2750,60 @@ static void sn_switch_to( n2n_edge_t * eee, size_t idx )
 #define NAT_SYM_RETRY_SECS  5
 #define NAT_SYM_MAX_TRIES   3
 
+/* Fixed-port refresh ("n"): how long to stay on a fresh random port before
+ * rebinding the configured port. Detection can outlast the first probe
+ * round (brother N2NF delayed/lost, sn2 slow to echo), so an unfinished
+ * verdict extends the window instead of freezing "unknown" prematurely —
+ * but only up to a hard cap, so a silent environment eventually gives up
+ * and restores the fixed port anyway. */
+#define NAT_REVERT_RETRY_SECS   20  /* re-arm the fixed-port revert delay */
+#define NAT_REVERT_MAX_SECS     90  /* absolute cap since fc_arm_time */
+#define NAT_REBUILD_MAX_TRIES   1   /* cap on "one more round" rebuilds per refresh */
+
+/* Re-run the whole NAT refresh from scratch — the shared entry of mgmt "n"
+ * and of the "one more round" rebuild: reset every classification field,
+ * rebuild the socket on a brand-new random mapping (empty filter whitelist =
+ * the brother's N2NF probe is a true stranger again), re-fire that probe and
+ * arm the window timer in both port modes. Returns 0 on success, -1 if the
+ * rebuild failed (the configured port, if any, is then restored). */
+static int nat_refresh_rebuild( n2n_edge_t * eee )
+{
+    eee->nat_type = N2N_NAT_UNKNOWN;
+    memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
+    memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+    memset(&eee->my_public_sock, 0, sizeof(n2n_sock_t));
+    eee->nat_probe_time = n2n_now();
+    eee->nat_probe_pending = 0;
+    eee->nat_bounce_seen = 0;
+    eee->fc_seen = 0;
+    eee->fc_window = 1;
+    eee->fc_arm_time = n2n_now();
+    eee->nat_sym_tries = 0;
+    eee->nat_final = 0;
+    eee->nat_reprobe = 0;
+    eee->nat_suppress_remap = 0;
+    closesocket(eee->udp_sock);   eee->udp_sock  = -1;
+    if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
+    if (setup_sockets(eee, 0 /* random port */) < 0) {
+        eee->nat_revert_at = 0;
+        eee->nat_refresh_start = 0;
+        /* Try to bring the main socket back before giving up. */
+        if (eee->local_port != 0)
+            setup_sockets(eee, (int)eee->local_port);
+        else
+            setup_sockets(eee, 0);
+        return -1;
+    }
+    if ( eee->supernode.family != 0 )
+    {
+        eee->nat_reprobe = 1; /* one-shot, consumed by send_register_super */
+        send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+    }
+    eee->nat_refresh_start = n2n_now();
+    eee->nat_revert_at = n2n_now() + 15;
+    return 0;
+}
+
 static int nat_addr_private( const uint8_t * a ) /* network-order IPv4 */
 {
     return ( a[0] == 10 ) ||
@@ -2961,6 +3017,10 @@ static void nat_autorecover( n2n_edge_t * eee )
                                only the supernode path is broken */
     if ( eee->nat_revert_at != 0 )
         return;             /* a mgmt "n" refresh is still settling */
+    if ( eee->nat_refresh_start != 0 &&
+         now - eee->nat_refresh_start < NAT_REVERT_MAX_SECS )
+        return;             /* an "n" refresh probe window is still open in any
+                               port mode: never rebuild out from under it */
     if ( eee->nat_autorecover_at != 0 &&
          now - eee->nat_autorecover_at < 300 )
         return;             /* at most one rebuild every 5 min */
@@ -4361,51 +4421,20 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                        (struct sockaddr*) &sender_sock, i);
                 return;
             }
-            /* Rebind a fresh random local port: the NAT mapping is brand-new
-             * and its source whitelist is empty again, so the brother's N2NF
-             * probe is a true stranger and the coming classification is
-             * accurate by construction. Everything after this is handled by
-             * the automatic remap path: the first REGISTER_ACK shows a
-             * changed my_public_sock, which wipes the old verdict, re-arms
-             * the stranger window and re-runs the full detection. */
-            eee->nat_suppress_remap = 0; /* drop any leftover flag from a previous revert */
-            closesocket(eee->udp_sock);   eee->udp_sock  = -1;
-            if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
-            if (setup_sockets(eee, 0 /* random port */) < 0) {
-                eee->nat_revert_at = 0;
-                /* Try to bring the main socket back before giving up. */
-                if (eee->local_port != 0)
-                    setup_sockets(eee, (int)eee->local_port);
-                else
-                    setup_sockets(eee, 0);
+            /* Refresh behaves like a restart: rebuild the socket on a
+             * brand-new random mapping (empty filter whitelist = the
+             * brother's N2NF probe is a true stranger again) and re-run the
+             * full detection from scratch. */
+            eee->nat_rebuild_tries = 0; /* fresh retest budget for this refresh */
+            if (nat_refresh_rebuild( eee ) < 0)
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                     "> socket rebind failed, NAT refresh aborted\n");
-                sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
-                       (struct sockaddr*) &sender_sock, i);
-                return;
-            }
-            /* sn1 registration fires at once: the NAT_REPROBE bit asks the SN
-             * to re-trigger the brother's N2NF probe, which now lands on the
-             * fresh mapping while the stranger window is still open. */
-            if ( eee->supernode.family != 0 )
-            {
-                eee->nat_reprobe = 1; /* one-shot, consumed by send_register_super */
-                send_register_super( eee, &(eee->supernode), 1, 0, NULL );
-            }
-            if (eee->local_port != 0) {
-                /* Fixed-port mode: stay on the random port until the probe
-                 * window (bounce + N2NF + one-shot symmetric check) is done,
-                 * then the main loop rebinds the configured port again. The
-                 * verdict from the random mapping is kept — NAT type is a
-                 * property of the NAT device, not of the port it was probed on. */
-                eee->nat_revert_at = n2n_now() + 15;
+            else if (eee->local_port != 0)
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                                    "> NAT refresh: probing on a fresh random port, fixed port restored in ~15s\n");
-            } else {
-                eee->nat_revert_at = 0;
+                                    "> NAT refresh: probing on a fresh random port, fixed port restored when the probe window settles\n");
+            else
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                     "> NAT refresh: probing on a fresh random port\n");
-            }
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
             return;
@@ -7866,41 +7895,87 @@ static int run_loop(n2n_edge_t * eee )
         struct timeval wait_time;
         time_t nowTime;
 
-        /* Fixed-port refresh: once the random-port probe window has elapsed,
-         * rebind the configured local port again. Classification already
-         * completed on the random mapping (NAT type is a property of the NAT
-         * device) and the one-shot remap suppression below keeps that verdict
-         * when the first ACK arrives on the restored port. */
+        /* Probe-window management, both port modes (armed by mgmt "n" and by each
+         * rebuild): while the verdict is still out and within the hard cap,
+         * extend the window — or, if the full-cone probe missed the stranger
+         * window and can never land on this mapping, re-run the whole refresh
+         * (same entry as mgmt "n") instead of downgrading. Once a verdict is
+         * in or the cap is hit, freeze and (fixed-port mode) rebind the
+         * configured port; nat_suppress_remap keeps the verdict when the
+         * first ACK arrives on the restored port. */
         if (eee->nat_revert_at != 0 && n2n_now() >= eee->nat_revert_at) {
-            eee->nat_revert_at = 0;
-            closesocket(eee->udp_sock);  eee->udp_sock = -1;
-            if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
-            /* Keep the verdict measured on the random mapping, but drop the
-             * observations: they belong to the dead mapping and would mix with
-             * fresh fixed-mapping echoes into a bogus "symmetric". */
-            memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
-            memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
-            eee->nat_bounce_seen = 0;
-            /* Freeze that verdict for good: the restored fixed port may still
-             * hold a live sn2 mapping from an earlier run, so re-measuring
-             * here is exactly the case that produces a bogus full cone. */
-            eee->nat_final = 1;
-            eee->nat_probe_pending = 0;
-            eee->nat_suppress_remap = 1; /* first ACK updates my_public_sock only, keeps the verdict */
-            if (setup_sockets(eee, (int)eee->local_port) < 0)
-                traceEvent(TRACE_ERROR, "NAT refresh: rebind to fixed port %u failed",
-                           (unsigned int)eee->local_port);
-            else {
-                traceEvent(TRACE_NORMAL, "NAT refresh: local port restored to %u",
-                           (unsigned int)eee->local_port);
-                /* Re-register at once: the SN (and, via the address-change
-                 * community push on the SN side, every peer) must learn the
-                 * restored fixed-port endpoint instead of the abandoned
-                 * random one — otherwise the edge lingers unreachable while
-                 * everyone still points at the old mapping. */
-                send_register_super( eee, &(eee->supernode), 1, 0, NULL );
-                eee->sn_wait = 1;
-                eee->last_register_req = n2n_now();
+            if ( eee->nat_type == N2N_NAT_UNKNOWN &&
+                 !eee->nat_final &&
+                 ( eee->nat_refresh_start == 0 ||
+                   n2n_now() - eee->nat_refresh_start < NAT_REVERT_MAX_SECS ) &&
+                 ( eee->fc_seen || eee->fc_window ||
+                   eee->nat_rebuild_tries < NAT_REBUILD_MAX_TRIES ) )
+            {
+                if ( eee->fc_seen || eee->fc_window )
+                {
+                    /* Evidence may still land: extend the window, re-firing
+                     * the brother probe while the stranger window is open. */
+                    eee->nat_revert_at = n2n_now() + NAT_REVERT_RETRY_SECS;
+                    if ( eee->fc_window )
+                    {
+                        eee->fc_arm_time = n2n_now();
+                        eee->nat_probe_pending = 0;
+                        eee->nat_sym_tries = 0;
+                        if ( eee->supernode.family != 0 )
+                        {
+                            eee->nat_reprobe = 1; /* one-shot, consumed by send_register_super */
+                            send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+                        }
+                    }
+                    traceEvent( TRACE_INFO, "NAT refresh: verdict still unknown, extending probe window" );
+                }
+                else
+                {
+                    /* Window spent with no full-cone evidence: it can never
+                     * arrive on this mapping, and a later probe would only
+                     * downgrade the verdict. Jump back to the refresh entry
+                     * (fresh random mapping, full detection again) — but only
+                     * for a bounded number of rounds, then freeze. */
+                    eee->nat_rebuild_tries++;
+                    traceEvent( TRACE_INFO, "NAT refresh: full-cone probe missed the stranger window, rebuilding the mapping for another round (%d/%d)",
+                                eee->nat_rebuild_tries, NAT_REBUILD_MAX_TRIES );
+                    if (nat_refresh_rebuild( eee ) < 0)
+                        traceEvent( TRACE_ERROR, "NAT refresh: socket rebuild failed, giving up" );
+                }
+            }
+            else
+            {
+                /* Verdict in hand, or the window hard-capped: stop refreshing
+                 * and freeze it. Drop the observations (they belong to the
+                 * abandoned mapping); fixed-port mode rebinds the configured
+                 * port and the first ACK there keeps the verdict thanks to
+                 * nat_suppress_remap. */
+                eee->nat_revert_at = 0;
+                eee->nat_refresh_start = 0;
+                memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
+                memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+                eee->nat_bounce_seen = 0;
+                eee->nat_final = 1;
+                eee->nat_probe_pending = 0;
+                if ( eee->local_port != 0 )
+                {
+                    eee->nat_suppress_remap = 1;
+                    closesocket(eee->udp_sock);  eee->udp_sock = -1;
+                    if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
+                    if (setup_sockets(eee, (int)eee->local_port) < 0)
+                        traceEvent(TRACE_ERROR, "NAT refresh: rebind to fixed port %u failed",
+                                   (unsigned int)eee->local_port);
+                    else {
+                        traceEvent(TRACE_NORMAL, "NAT refresh: local port restored to %u",
+                                   (unsigned int)eee->local_port);
+                        /* Re-register so the SN (and every peer, via the
+                         * address-change community push) switches to the
+                         * restored fixed-port endpoint. */
+                        send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+                        eee->sn_wait = 1;
+                        eee->last_register_req = n2n_now();
+                    }
+                }
             }
         }
 
