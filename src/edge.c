@@ -3684,6 +3684,14 @@ static int send_PACKET( n2n_edge_t * eee,
             if (do_query)
                 p->last_query_sent = now;
         }
+
+        /* No on-demand punch here: starting the WAN punch loop from this
+         * packet would set punch_start_time before the QUERY_PEER reply
+         * arrives, and the PUNCH handler (LAN-first) would then take its
+         * "already running" branch and skip the LAN phase. Keep LAN ahead of
+         * WAN: the QUERY below brings the PUNCH reply, the PUNCH handler
+         * opens the LAN phase (same public IP) or starts the WAN punch, and
+         * the LAN timeout in check_punch_timeouts falls back to WAN. */
         PEERS_UNLOCK(eee);
 
         if (do_query && p) {
@@ -5795,22 +5803,36 @@ process_n2n_packet:
             pending->psp_logged = 0;
             pending->p2p_logged = 0;
 
+            /* This PEER_INFO carries the PUNCH flag, which the supernode sets
+             * only in its QUERY_PEER handler — i.e. for exactly the peer that
+             * queried us (communication demand). Startup dumps, NAT-change
+             * pushes and relay advertisements never set PUNCH, so starting the
+             * hole-punch right here targets that one peer only and cannot fan
+             * out to the whole community. Opening the hole immediately beats
+             * waiting for our own outbound packet (send_PACKET) or the first
+             * relayed frame (handle_PACKET). */
+            /* Punch via try_peer_lan_ipv4: besides the plain public-address
+             * REGISTER (try_send_register), it starts the LAN phase when
+             * the peer shares our public IP (try_send_register_lan) and,
+             * on every path, fires a REGISTER at the peer's reported LAN
+             * address (sockets[1]). A plain try_send_register drops that
+             * address, which strands same-LAN peers on the public-address
+             * path (hairpin-dependent) and breaks LAN direct links. The
+             * reported IPv6 stays a parallel candidate only. */
             if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1 &&
-                eee->sn_ipv6_support) {
+                eee->sn_ipv6_support)
+            {
                 /* Dual-stack supernode: sock6 was learned via real IPv6
-                 * registration. Keep the original behaviour exactly — try
-                 * the IPv6 address directly. */
+                 * registration — try the IPv6 address directly. */
                 try_send_register(eee, 1, pi.mac, &pending->sock6);
             } else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
-                /* IPv4-only supernode: sock6 is an edge-reported address
-                 * (extra way to obtain an IPv6 address). It must NOT change
-                 * the LAN / IPv4 direct flow — run the exact same LAN/IPv4
-                 * logic, using the reported IPv6 only as an ADDITIONAL
-                 * parallel candidate. */
+                /* IPv4-only supernode: sock6 is an edge-reported address.
+                 * Keep the LAN/IPv4 direct flow, IPv6 as a parallel
+                 * candidate only. */
                 try_peer_lan_ipv4(eee, pi.aflags, &pi.sockets[0], &pi.sockets[1],
                                   pending, &pending->sock6);
             } else {
-                /* No IPv6 candidate: unchanged LAN / IPv4 direct flow. */
+                /* No IPv6 candidate: unchanged LAN/IPv4 direct flow. */
                 try_peer_lan_ipv4(eee, pi.aflags, &pi.sockets[0], &pi.sockets[1],
                                   pending, NULL);
             }
