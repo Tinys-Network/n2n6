@@ -20,6 +20,12 @@
  * the announcement. */
 #define SN_RELAY_ADVERT_ACTIVE_SECS  5
 
+/** Seconds: an edge whose unicast was relayed through this sn within this
+ * window counts as "communicating" with its last relayed counterpart. When
+ * such a pair's address changes, the sn punches that counterpart directly
+ * instead of the plain (non-PUNCH) broadcast. */
+#define SN_FWD_PUNCH_ACTIVE_SECS    30
+
 /** maximum length of command line arguments */
 #define MAX_CMDLINE_BUFFER_LENGTH       4096
 
@@ -879,6 +885,7 @@ struct n2n_sn
 #define N2N_SN_MAX_WS 64
     ws_conn_t           ws_conns[N2N_SN_MAX_WS]; /* WS connection table (edge connected via WS). */
     struct peer_info *  edges;          /* Link list of registered edges. */
+    struct sn_punch_pair * punch_pairs; /* hard-NAT punch pairs (sn-coordinated 2s rounds). */
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     int                 ipv4_available; /* 0=unavailable, 1=available */
     int                 ipv6_available; /* 0=unavailable, 1=available */
@@ -2737,6 +2744,13 @@ static void send_fc_probe_request( n2n_sn_t *sss,
     }
 }
 
+/* Build and send a PUNCH PEER_INFO describing edge `other` to edge `self`
+ * (at its recorded public address). Both the round-0 wake-up and the
+ * per-round handoff use this. */
+static void sn_send_punch_info( n2n_sn_t * sss, const n2n_community_t community,
+                                const struct peer_info * self,
+                                const struct peer_info * other );
+
 /* push_nat_to_community: an edge's reported NAT type changed (update_edge
  * returned 2) while its address stayed the same — nobody else would learn
  * it (PEER_INFO pushes otherwise fire only on new/addr-changed edges).
@@ -2744,7 +2758,8 @@ static void send_fc_probe_request( n2n_sn_t *sss,
  * member so their mgmt "nat" column stays fresh. */
 static void push_nat_to_community( n2n_sn_t *sss,
                                    struct peer_info *changed,
-                                   const n2n_community_t community )
+                                   const n2n_community_t community,
+                                   int addr_changed )
 {
     n2n_common_t    pi_cmn;
     n2n_PEER_INFO_t pi;
@@ -2794,10 +2809,40 @@ static void push_nat_to_community( n2n_sn_t *sss,
     pix = 0;
     encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
 
+    time_t now = time(NULL);
+    /* First the communicating counterpart gets a PUNCH right away: its
+     * address just changed, so both sides must re-punch immediately
+     * (principle 8). */
     for ( p = sss->edges; p; p = p->next )
     {
         if ( p == changed ) continue;
         if ( memcmp(p->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+        /* A communicating counterpart (unicast relayed between these two
+         * recently) gets a PUNCH instead of the plain broadcast. */
+        int communicating = ( addr_changed &&
+                              ((p->last_fwd_time != 0 &&
+                                (now - p->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
+                                memcmp(p->last_fwd_mac, changed->mac_addr, N2N_MAC_SIZE) == 0) ||
+                               (changed->last_fwd_time != 0 &&
+                                (now - changed->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
+                                memcmp(changed->last_fwd_mac, p->mac_addr, N2N_MAC_SIZE) == 0)) );
+        if ( communicating )
+            sn_send_punch_info( sss, community, p, changed );
+    }
+    /* Then the plain PEER_INFO (no PUNCH) to everyone else, so they just
+     * refresh their local info without starting a punch. */
+    for ( p = sss->edges; p; p = p->next )
+    {
+        if ( p == changed ) continue;
+        if ( memcmp(p->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+        int communicating = ( addr_changed &&
+                              ((p->last_fwd_time != 0 &&
+                                (now - p->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
+                                memcmp(p->last_fwd_mac, changed->mac_addr, N2N_MAC_SIZE) == 0) ||
+                               (changed->last_fwd_time != 0 &&
+                                (now - changed->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
+                                memcmp(changed->last_fwd_mac, p->mac_addr, N2N_MAC_SIZE) == 0)) );
+        if ( communicating ) continue;
         sn_send_to_peer( sss, p, pibuf, pix );
     }
     traceEvent(TRACE_DEBUG, "pushed NAT change of %s to community",
@@ -2976,6 +3021,226 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
      * switches on forwarding without self-judging eligibility. Idempotent. */
     relay->relay_adv_live = now; /* mark as "in use" for mgmt display */
     advertise_relay_to( sss, cmn, relay, relay );
+}
+
+/* ---- hard-NAT punch pair coordination (both edges NAT3/NAT4) ----
+ * The pair punches in 2s rounds; every round each side re-registers and the
+ * sn waits for both, then hands each the other's latest address (PUNCH) so
+ * they punch simultaneously. The pair forms on the first QUERY_PEER (which
+ * also wakes the target) and is dropped once round querying stops. */
+
+static int punch_pair_hard_nat( uint8_t nat_type )
+{
+    return ( nat_type == N2N_NAT_SYMMETRIC ||
+             nat_type == N2N_NAT_PORT_RESTRICT );
+}
+
+static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
+                                            const n2n_community_t community,
+                                            const n2n_mac_t a,
+                                            const n2n_mac_t b )
+{
+    struct sn_punch_pair *p = sss->punch_pairs;
+    while ( p )
+    {
+        if ( memcmp(p->community, community, sizeof(n2n_community_t)) == 0 &&
+             memcmp(p->edge_a, a, N2N_MAC_SIZE) == 0 &&
+             memcmp(p->edge_b, b, N2N_MAC_SIZE) == 0 )
+            return p;
+        p = p->next;
+    }
+    return NULL;
+}
+
+/* Touch (or create) the pair for (a,b). Returns 1 when newly created; the
+ * round-0 join messages (requester reply + target wake-up) go out only then. */
+static int sn_pair_touch( n2n_sn_t * sss, const n2n_community_t community,
+                          const n2n_mac_t a, const n2n_mac_t b, time_t now )
+{
+    n2n_mac_t ea, eb;
+    if ( memcmp(a, b, N2N_MAC_SIZE) < 0 )
+    {
+        memcpy(ea, a, N2N_MAC_SIZE);
+        memcpy(eb, b, N2N_MAC_SIZE);
+    }
+    else
+    {
+        memcpy(ea, b, N2N_MAC_SIZE);
+        memcpy(eb, a, N2N_MAC_SIZE);
+    }
+    struct sn_punch_pair *p = sn_pair_find( sss, community, ea, eb );
+    if ( p )
+    {
+        p->last_activity = now;
+        return 0;
+    }
+    p = (struct sn_punch_pair*)calloc(1, sizeof(struct sn_punch_pair));
+    if ( !p )
+        return 0;
+    memcpy(p->community, community, sizeof(n2n_community_t));
+    memcpy(p->edge_a, ea, N2N_MAC_SIZE);
+    memcpy(p->edge_b, eb, N2N_MAC_SIZE);
+    p->last_activity = now;
+    p->next = sss->punch_pairs;
+    sss->punch_pairs = p;
+    /* Keep the table bounded: drop the least recently active pair when full. */
+    {
+        struct sn_punch_pair *scan = sss->punch_pairs;
+        struct sn_punch_pair *oldest = NULL, *oldest_prev = NULL, *prev = NULL;
+        int n = 0;
+        while ( scan )
+        {
+            n++;
+            if ( !oldest || scan->last_activity < oldest->last_activity )
+            {
+                oldest = scan;
+                oldest_prev = prev;
+            }
+            prev = scan;
+            scan = scan->next;
+        }
+        if ( n > PUNCH_PAIR_MAX && oldest && oldest != p )
+        {
+            if ( oldest_prev )
+                oldest_prev->next = oldest->next;
+            else
+                sss->punch_pairs = oldest->next;
+            free(oldest);
+        }
+    }
+    return 1;
+}
+
+/* Build and send a PUNCH PEER_INFO describing edge `other` to edge `self`
+ * (at its recorded public address). Both the round-0 wake-up and the
+ * per-round handoff use this. */
+static void sn_send_punch_info( n2n_sn_t * sss, const n2n_community_t community,
+                                const struct peer_info * self,
+                                const struct peer_info * other )
+{
+    n2n_common_t    cmn2;
+    n2n_PEER_INFO_t pi;
+    uint8_t         encbuf[N2N_SN_PKTBUF_SIZE];
+    size_t          encx = 0;
+    struct sockaddr_storage dst;
+    socklen_t dlen = sizeof(dst);
+    macstr_t        src_buf, dst_buf;
+
+    memset(&cmn2, 0, sizeof(cmn2));
+    cmn2.ttl   = N2N_DEFAULT_TTL;
+    cmn2.pc    = n2n_peer_info;
+    cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
+    memcpy( cmn2.community, community, sizeof(n2n_community_t) );
+
+    memset(&pi, 0, sizeof(pi));
+    memcpy( pi.mac, other->mac_addr, N2N_MAC_SIZE );
+    pi.aflags = N2N_AFLAGS_PUNCH_REQUEST;
+    if (other->num_sockets > 1 && other->sockets[1].family != 0 &&
+        other->sockets[1].port != 0)
+        pi.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
+    /* Always put IPv4 in sockets[0] if available, so both addresses are carried */
+    if (other->sock.family == AF_INET)
+        pi.sockets[0] = other->sock;
+    else if (other->sock6.family == AF_INET6)
+        pi.sockets[0] = other->sock6;
+    if (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET)
+        pi.sockets[1] = other->sockets[1];
+    if (other->sock6.family == AF_INET6) {
+        pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        pi.sock6 = other->sock6;
+    }
+    if (other->same_lan_as_sn)
+        pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
+    if (other->version[0] != '\0') {
+        strncpy(pi.version, other->version, sizeof(pi.version) - 1);
+        pi.version[sizeof(pi.version) - 1] = '\0';
+    }
+    if (other->os_name[0] != '\0') {
+        strncpy(pi.os_name, other->os_name, sizeof(pi.os_name) - 1);
+        pi.os_name[sizeof(pi.os_name) - 1] = '\0';
+    }
+    pi.assigned_ip = other->assigned_ip;
+    /* Carry the peer's NAT type so edge mgmt can display it */
+    pi.aflags |= N2N_NAT_AFLAGS(other->nat_type);
+
+    encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
+    if ( self->sockets[0].family != 0 &&
+         fill_sockaddr((struct sockaddr*)&dst, dlen, &self->sockets[0]) == 0 )
+    {
+        SOCKET send_sock = (self->sockets[0].family == AF_INET6) ? sss->sock6 : sss->sock;
+        socklen_t slen = (self->sockets[0].family == AF_INET6)
+                       ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+        sendto( send_sock, encbuf, encx, 0, (struct sockaddr*)&dst, slen );
+        traceEvent(TRACE_DEBUG, "punch handoff %s -> %s",
+                   macaddr_str(src_buf, other->mac_addr),
+                   macaddr_str(dst_buf, self->mac_addr));
+    }
+}
+
+/* REGISTER_SUPER hook: update this edge's round-registration time; once both
+ * edges of a pair have re-registered since the last exchange, hand each the
+ * other's latest address (PUNCH) so the round punches simultaneously. Only
+ * punch-round re-registrations (N2N_AFLAGS_PUNCH_ROUND) drive the handoff:
+ * the edges' plain periodic re-registrations are ignored, otherwise the sn
+ * would keep pushing PUNCHes forever once punching stopped (relay-only edges
+ * still re-register on their ~30s keepalive cadence). */
+static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
+                                 const n2n_community_t community, time_t now,
+                                 int punch_round )
+{
+    struct sn_punch_pair *p = sss->punch_pairs;
+    while ( p )
+    {
+        if ( memcmp(p->community, community, sizeof(n2n_community_t)) != 0 )
+        {
+            p = p->next;
+            continue;
+        }
+        int is_a = (memcmp(p->edge_a, mac, N2N_MAC_SIZE) == 0);
+        int is_b = (memcmp(p->edge_b, mac, N2N_MAC_SIZE) == 0);
+        if ( !is_a && !is_b )
+        {
+            p = p->next;
+            continue;
+        }
+        if ( !punch_round )
+            return;
+        if ( is_a )
+            p->a_reg = now;
+        else
+            p->b_reg = now;
+        /* The later registrant triggers: both reg times newer than the last
+         * exchange means both sides are ready for this round. */
+        if ( (is_a ? p->b_reg : p->a_reg) > p->last_exchanged )
+        {
+            struct peer_info *ea = find_peer_by_mac( sss->edges, p->edge_a );
+            struct peer_info *eb = find_peer_by_mac( sss->edges, p->edge_b );
+            if ( ea && eb )
+            {
+                sn_send_punch_info( sss, community, ea, eb ); /* a <- b */
+                sn_send_punch_info( sss, community, eb, ea ); /* b <- a */
+            }
+            p->last_exchanged = now;
+        }
+        return;
+    }
+}
+
+/* Drop pairs whose edges both stopped round-querying (PUNCH_PAIR_HOLD). */
+static void sn_pair_purge( n2n_sn_t * sss, time_t now )
+{
+    struct sn_punch_pair **pp = &sss->punch_pairs;
+    while ( *pp )
+    {
+        struct sn_punch_pair *p = *pp;
+        if ( (now - p->last_activity) > PUNCH_PAIR_HOLD )
+        {
+            *pp = p->next;
+            free(p);
+        }
+        else
+            pp = &p->next;
+    }
 }
 
 /** Examine a datagram and determine what to do with it.
@@ -3398,6 +3663,17 @@ static int process_udp( n2n_sn_t * sss,
              * sign direct failed; push the community relay peer so the members
              * can switch to it. */
             advertise_relay_on_pair( sss, &cmn, pkt.srcMac, pkt.dstMac );
+            /* Track the communicating pair: unicast relayed through the sn
+             * means the two edges are talking (relay state). A later address
+             * change on either side then punches the counterpart directly. */
+            {
+                struct peer_info *fwd_src = find_peer_by_mac( sss->edges, pkt.srcMac );
+                if ( fwd_src )
+                {
+                    memcpy(fwd_src->last_fwd_mac, pkt.dstMac, N2N_MAC_SIZE);
+                    fwd_src->last_fwd_time = now;
+                }
+            }
             try_forward( sss, &cmn, pkt.dstMac, rec_buf, encx );
         }
         else
@@ -3524,6 +3800,22 @@ static int process_udp( n2n_sn_t * sss,
         struct peer_info *target = find_peer_by_mac( sss->edges, query.targetMac );
         if ( target )
         {
+            /* Hard-NAT pair (both NAT3/NAT4): their 2s punch rounds are
+             * coordinated by the sn — the pair forms on the first query, which
+             * wakes the target; after that the per-round handoff is exchanged
+             * in sn_pair_on_register once both edges re-register, so the direct
+             * reply and the wake-up go out only when the pair first forms
+             * (later ones would punch early, out-of-round). */
+            struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
+            int hard_pair = ( requester &&
+                              punch_pair_hard_nat( requester->nat_type ) &&
+                              punch_pair_hard_nat( target->nat_type ) );
+            int pair_new = 0;
+            if ( hard_pair )
+                pair_new = sn_pair_touch( sss, cmn.community,
+                                          query.srcMac, query.targetMac, now );
+            if ( !hard_pair || pair_new )
+            {
             memset( &cmn2, 0, sizeof(cmn2) );
             cmn2.ttl   = N2N_DEFAULT_TTL;
             cmn2.pc    = n2n_peer_info;
@@ -3569,10 +3861,10 @@ static int process_udp( n2n_sn_t * sss,
                 socklen_t slen = (sender_sock->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
                 sendto( send_sock, encbuf, encx, 0, sender_sock, slen );
             }
+            }
 
             /* Simultaneous open: also push A's address to B so B punches back */
-            struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
-            if ( requester )
+            if ( requester && ( !hard_pair || pair_new ) )
             {
                 n2n_PEER_INFO_t pi2;
                 n2n_common_t    cmn3;
@@ -4039,6 +4331,14 @@ static int process_udp( n2n_sn_t * sss,
                      N2N_NAT_FROM_AFLAGS(reg.aflags),
                      use_request_ip, use_requested_ip );
 
+        /* Hard-NAT punch pair: refresh this edge's round-registration time
+         * and, when both pair edges have re-registered since the last
+         * exchange, hand each the other's latest address (PUNCH) so the
+         * round punches simultaneously. */
+        if ( !query_only )
+            sn_pair_on_register( sss, reg.edgeMac, cmn.community, now,
+                                 (reg.aflags & N2N_AFLAGS_PUNCH_ROUND) != 0 );
+
         /* Edge metadata changed while staying in the table: give the rest of the
          * community the fresh PEER_INFO. is_new_edge == 2 = NAT type changed
          * with unchanged address; == 3 = known edge whose address changed
@@ -4048,7 +4348,7 @@ static int process_udp( n2n_sn_t * sss,
         if ( is_new_edge == 2 || is_new_edge == 3 )
             push_nat_to_community( sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
-                                   cmn.community );
+                                   cmn.community, is_new_edge == 3 );
 
         /* Brand-new edge (update_edge == 1) or known edge whose public address
          * changed (== 3: its NAT mapping was recreated, so the stranger window
@@ -4799,6 +5099,7 @@ static int run_loop( n2n_sn_t * sss )
         }
 
         purge_expired_registrations( &(sss->edges) );
+        sn_pair_purge( sss, now );
         sn_ws_purge(sss, now);
         if (sss->traffic_stats_enabled) {
             static time_t last_stats_purge = 0;

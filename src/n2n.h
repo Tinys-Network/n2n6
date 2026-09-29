@@ -285,20 +285,19 @@ struct peer_info {
     time_t              last_probe_sent;   /* time last keepalive PROBE was sent */
     uint8_t             keepalive_fails;   /* consecutive keepalive failures */
     time_t              last_query_sent;   /* time last query_peer was sent, for rate-limiting */
-    time_t              last_punch_probe;  /* time last PROBE was sent during hole-punch */
     uint8_t             punch_retry_count; /* number of punch retries, remove after max */
-    uint8_t             register_retry_count; /* REGISTER retries after PROBE_ACK, max 3 */
-    time_t              last_register_sent;   /* time last REGISTER was sent after PROBE_ACK */
+    uint8_t             punch_round;       /* current 2s punch round (0-based), reset on start_punch */
+    time_t              punch_round_time;  /* round anchor for the 2s punch cadence */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
     time_t              p2p_est_time;      /* time P2P was established (set_peer_operational); for transition grace */
     n2n_sock_t          temp_local_sock;   /* dynamically selected best local IP for this peer */
     uint8_t             temp_local_sock_valid; /* 1 if temp_local_sock is valid */
-    uint8_t             psp_logged;        /* 1 if PsP message already printed for current state */
-    uint8_t             p2p_logged;        /* 1 if P2P direct message already printed for current state */
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
     time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
     time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
+    uint8_t             last_fwd_mac[N2N_MAC_SIZE]; /* sn: last unicast peer this edge's data was relayed to (communicating-pair tracking) */
+    time_t              last_fwd_time;     /* sn: time of that last relayed unicast (0=never) */
     uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
     time_t              relay_adv_live;    /* sn: last time this peer was advertised AS the community relay (0=never) */
     /* Compact packet protocol support (version 0xE5 header) */
@@ -306,6 +305,23 @@ struct peer_info {
     uint16_t            transform_id;      /* transform ID learned from PACKET headers (for SN legacy conversion) */
     /* WebSocket: non-NULL means this edge is connected via WS, forwarding uses ws_send instead of UDP sendto */
     ws_conn_t *         ws;
+};
+
+/* Supernode-side punch pair: two edges both classified hard NAT (NAT3/NAT4)
+ * coordinate their 2s punch rounds through the supernode — every round each
+ * side re-registers, and once both have, the sn hands each the other's latest
+ * address (PUNCH) so they punch simultaneously. */
+#define PUNCH_PAIR_MAX  64    /* max simultaneous hard-NAT punch pairs */
+#define PUNCH_PAIR_HOLD 10    /* sec: drop a pair whose edges both stopped round-querying */
+struct sn_punch_pair {
+    struct sn_punch_pair * next;
+    n2n_community_t     community;
+    n2n_mac_t           edge_a;         /* canonical order: lower MAC first */
+    n2n_mac_t           edge_b;
+    time_t              a_reg;          /* last round REGISTER_SUPER time of edge_a */
+    time_t              b_reg;          /* last round REGISTER_SUPER time of edge_b */
+    time_t              last_exchanged; /* last handoff exchange time (0 = none yet) */
+    time_t              last_activity;  /* last QUERY touching this pair (purge key) */
 };
 
 struct n2n_edge; /* forward declaration, defined below */
@@ -649,6 +665,8 @@ struct n2n_edge
                                           change only) */
     uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
                                            re-trigger the brother's N2NF probe (mgmt "n") */
+    uint8_t             punch_round_reg; /* one-shot: next send_register_super carries the
+                                           punch-round flag (hard-NAT round re-registration) */
     time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured
                                            local port again once this time is reached (0 = none) */
     time_t              nat_refresh_start; /* mgmt "n": when the refresh began. Independent of

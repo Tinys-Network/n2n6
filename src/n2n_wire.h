@@ -167,6 +167,10 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 
 /* Linked with n2n_register_super in n2n_pc_t. Only from edge to supernode. */
 #define N2N_AFLAGS_LOCAL_SOCKET   0x0001  /* local_sock field is valid */
+#define N2N_AFLAGS_PUNCH_ROUND    0x0004  /* REGISTER_SUPER is a hard-NAT punch-round
+                                             re-registration: the sn uses it to trigger
+                                             the pair handoff only for these, never for
+                                             the plain periodic re-registrations */
 #define N2N_AFLAGS_NAT_SYMMETRIC  0x0040  /* edge reports symmetric NAT (dual-sn reflection) */
 #define N2N_AFLAGS_NAT_BOUNCE     0x0080  /* edge asks this sn for a NAT bounce test:
                                              sn replies from an extra helper socket
