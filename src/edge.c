@@ -67,6 +67,7 @@
 #define PUNCH_ROUNDS                    5    /* punch rounds before giving up */
 #define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
+#define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -5903,21 +5904,33 @@ process_n2n_packet:
                 ( prev_sock6.family != pending->sock6.family ||
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
-            /* This PEER_INFO carries the PUNCH flag, which the supernode sets
-             * only in its QUERY_PEER handler — i.e. for exactly the peer that
-             * queried us (communication demand) — and in the address-change
-             * push to the communicating partner. Startup dumps, NAT-change
-             * broadcasts and relay advertisements never set PUNCH.
-             *
-             * A changed address restarts the whole punch unconditionally:
+            /* A changed address restarts the whole punch unconditionally:
              * either side of a communicating pair moved => stop the old punch
              * and start a brand-new complete two-way punch, whatever the
              * transport state (relay or direct) and whatever the previous
              * punch outcome (including a previous give-up). An unchanged
-             * address never restarts the rounds: a hard-NAT handoff only
-             * refreshes the address (the rounds keep their own cadence), and
-             * a fresh or gave-up peer is armed exactly as before. */
-            if ( addr_changed || pending->punch_start_time == 0 || pending->punch_failed )
+             * address never restarts an established direct link: set_peer_operational
+             * resets the punch state on going direct, so a handoff PUNCH would
+             * otherwise re-arm the rounds in an endless loop — a direct peer
+             * just refreshes its address. Same-address handoffs never restart
+             * a punch that is already in progress — during the WAN rounds
+             * (punch_start_time) or the LAN phase (lan_punch_start). Restarting
+             * there is a self-feeding burst: the restart's own
+             * try_send_register -> start_punch sends a fresh QUERY, whose
+             * PUNCH reply restarts again — an RTT-paced loop that fires right
+             * after startup while the NAT type is still unknown and the sn
+             * answers every QUERY. A peer that gave up is left alone: the
+             * 40s x 3 retry chain in check_punch_timeouts re-arms the rounds
+             * and finally settles on relay only, so a same-address handoff
+             * must not reset that timer by re-arming right here. Only an idle
+             * peer with no punch running and no live direct link is re-armed
+             * exactly as before. */
+            int direct_alive = ( pending->direct_seen != 0 &&
+                                 ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
+            int punch_running = ( pending->punch_start_time != 0 ||
+                                  pending->lan_punch_start != 0 );
+            if ( addr_changed ||
+                 ( !punch_running && !direct_alive ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );

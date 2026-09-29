@@ -313,6 +313,8 @@ struct peer_info {
  * address (PUNCH) so they punch simultaneously. */
 #define PUNCH_PAIR_MAX  64    /* max simultaneous hard-NAT punch pairs */
 #define PUNCH_PAIR_HOLD 10    /* sec: drop a pair whose edges both stopped round-querying */
+#define PUNCH_SYNC_MIN_DIFF_MS 10 /* ms: round-latency differences below this are noise */
+#define PUNCH_SYNC_MAX_DIFF_MS 1000 /* ms: larger gaps mean hopelessly asymmetric routes, skip compensation */
 struct sn_punch_pair {
     struct sn_punch_pair * next;
     n2n_community_t     community;
@@ -322,6 +324,18 @@ struct sn_punch_pair {
     time_t              b_reg;          /* last round REGISTER_SUPER time of edge_b */
     time_t              last_exchanged; /* last handoff exchange time (0 = none yet) */
     time_t              last_activity;  /* last QUERY touching this pair (purge key) */
+    /* Round-start sync: from the first handoff the sn times each side's next
+     * re-registration; the difference, halved, defers the near side's handoff
+     * so both edges receive the round punch signals simultaneously. */
+    int64_t             sync_send_ms;   /* ms: first handoff send time (measurement start) */
+    int64_t             sync_reg_a_ms;  /* ms: edge_a's first registration after the start */
+    int64_t             sync_reg_b_ms;  /* ms: edge_b's first registration after the start */
+    int64_t             sync_delay_ms;  /* ms: compensation delay applied to the near side */
+    int                 sync_near_a;    /* 1: edge_a is the near side (gets the delayed send) */
+    int                 sync_armed;     /* 1: delay measured, compensation active */
+    int64_t             defer_due_ms;   /* ms: due time of the pending near-side send (0 = none) */
+    n2n_mac_t           defer_self;     /* pending send: recipient */
+    n2n_mac_t           defer_other;    /* pending send: peer to describe */
 };
 
 struct n2n_edge; /* forward declaration, defined below */

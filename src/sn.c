@@ -3023,17 +3023,17 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     advertise_relay_to( sss, cmn, relay, relay );
 }
 
-/* ---- hard-NAT punch pair coordination (both edges NAT3/NAT4) ----
- * The pair punches in 2s rounds; every round each side re-registers and the
- * sn waits for both, then hands each the other's latest address (PUNCH) so
- * they punch simultaneously. The pair forms on the first QUERY_PEER (which
- * also wakes the target) and is dropped once round querying stops. */
+/* ---- punch pair coordination ----
+ * Every QUERY_PEER forms or touches a pair. The pair punches in 2s rounds;
+ * every round each side re-registers and the sn waits for both, then hands
+ * each the other's latest address (PUNCH) so they punch simultaneously.
+ * While those handoffs are live (last_exchanged fresh) the QUERY_PEER
+ * replies are suppressed; the pair is dropped once round querying stops. */
 
-static int punch_pair_hard_nat( uint8_t nat_type )
-{
-    return ( nat_type == N2N_NAT_SYMMETRIC ||
-             nat_type == N2N_NAT_PORT_RESTRICT );
-}
+/* sec: a QUERY_PEER reply fires only when the pair is new or its last handoff
+ * is at least this old — within the 2s rounds the handoff already refreshes
+ * both edges each round, so an extra reply would just duplicate the PUNCH. */
+#define PUNCH_QUERY_REFRESH_SECS 3
 
 static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
                                             const n2n_community_t community,
@@ -3189,6 +3189,7 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
                                  int punch_round )
 {
     struct sn_punch_pair *p = sss->punch_pairs;
+    macstr_t mac_buf_a, mac_buf_b;
     while ( p )
     {
         if ( memcmp(p->community, community, sizeof(n2n_community_t)) != 0 )
@@ -3209,6 +3210,35 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             p->a_reg = now;
         else
             p->b_reg = now;
+        /* Round-start sync: from the first handoff, time each side's next
+         * re-registration; the difference, halved, defers the near side's
+         * handoff so both edges receive the round punch signals together. */
+        if ( p->sync_send_ms != 0 && !p->sync_armed )
+        {
+            if ( is_a && p->sync_reg_a_ms == 0 )
+                p->sync_reg_a_ms = sn_monotonic_ms();
+            else if ( is_b && p->sync_reg_b_ms == 0 )
+                p->sync_reg_b_ms = sn_monotonic_ms();
+        }
+        if ( !p->sync_armed && p->sync_send_ms != 0 &&
+             p->sync_reg_a_ms != 0 && p->sync_reg_b_ms != 0 )
+        {
+            int64_t diff = (p->sync_reg_a_ms > p->sync_reg_b_ms)
+                         ? p->sync_reg_a_ms - p->sync_reg_b_ms
+                         : p->sync_reg_b_ms - p->sync_reg_a_ms;
+            /* Ignore sub-10ms differences: at the 100ms loop tick these are
+             * quantization noise, not a real route asymmetry. And skip
+             * compensation above 1s: the delay would push the near side's
+             * round past the next 2s round window, aligning nothing. */
+            p->sync_delay_ms = ( diff >= PUNCH_SYNC_MIN_DIFF_MS &&
+                                 diff <  PUNCH_SYNC_MAX_DIFF_MS ) ? diff / 2 : 0;
+            p->sync_near_a   = (p->sync_reg_a_ms <= p->sync_reg_b_ms);
+            p->sync_armed    = 1;
+            traceEvent( TRACE_INFO, "punch sync: delay %lld ms, near side %s",
+                        (long long)p->sync_delay_ms,
+                        macaddr_str(mac_buf_a,
+                                    p->sync_near_a ? p->edge_a : p->edge_b) );
+        }
         /* The later registrant triggers: both reg times newer than the last
          * exchange means both sides are ready for this round. */
         if ( (is_a ? p->b_reg : p->a_reg) > p->last_exchanged )
@@ -3217,12 +3247,62 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             struct peer_info *eb = find_peer_by_mac( sss->edges, p->edge_b );
             if ( ea && eb )
             {
-                sn_send_punch_info( sss, community, ea, eb ); /* a <- b */
-                sn_send_punch_info( sss, community, eb, ea ); /* b <- a */
+                if ( p->sync_armed && p->sync_delay_ms > 0 )
+                {
+                    /* Far side immediately, near side after the measured
+                     * half-difference, so both punches land together. */
+                    struct peer_info *far_peer, *near_peer;
+                    if ( p->sync_near_a )
+                    {
+                        far_peer  = eb;
+                        near_peer = ea;
+                    }
+                    else
+                    {
+                        far_peer  = ea;
+                        near_peer = eb;
+                    }
+                    sn_send_punch_info( sss, community, far_peer, near_peer );
+                    memcpy( p->defer_self,  near_peer->mac_addr, N2N_MAC_SIZE );
+                    memcpy( p->defer_other, far_peer->mac_addr, N2N_MAC_SIZE );
+                    p->defer_due_ms = sn_monotonic_ms() + p->sync_delay_ms;
+                    traceEvent( TRACE_DEBUG, "punch sync: defer handoff to %s by %lld ms",
+                                macaddr_str(mac_buf_b, near_peer->mac_addr),
+                                (long long)p->sync_delay_ms );
+                }
+                else
+                {
+                    sn_send_punch_info( sss, community, ea, eb ); /* a <- b */
+                    sn_send_punch_info( sss, community, eb, ea ); /* b <- a */
+                }
             }
+            /* First handoff: anchor the round-latency measurement. */
+            if ( p->last_exchanged == 0 )
+                p->sync_send_ms = sn_monotonic_ms();
             p->last_exchanged = now;
         }
         return;
+    }
+}
+
+/* Fire pending deferred handoffs whose delay has elapsed: the near side of a
+ * sync pair gets its PUNCH this way, half a round-trip difference after the
+ * far side, so both edges start their round punches simultaneously. */
+static void sn_punch_defer_tick( n2n_sn_t * sss )
+{
+    int64_t now_ms = sn_monotonic_ms();
+    struct sn_punch_pair *p = sss->punch_pairs;
+    while ( p )
+    {
+        if ( p->defer_due_ms != 0 && now_ms >= p->defer_due_ms )
+        {
+            p->defer_due_ms = 0;
+            struct peer_info *self  = find_peer_by_mac( sss->edges, p->defer_self );
+            struct peer_info *other = find_peer_by_mac( sss->edges, p->defer_other );
+            if ( self && other )
+                sn_send_punch_info( sss, p->community, self, other );
+        }
+        p = p->next;
     }
 }
 
@@ -3800,21 +3880,39 @@ static int process_udp( n2n_sn_t * sss,
         struct peer_info *target = find_peer_by_mac( sss->edges, query.targetMac );
         if ( target )
         {
-            /* Hard-NAT pair (both NAT3/NAT4): their 2s punch rounds are
-             * coordinated by the sn — the pair forms on the first query, which
-             * wakes the target; after that the per-round handoff is exchanged
-             * in sn_pair_on_register once both edges re-register, so the direct
-             * reply and the wake-up go out only when the pair first forms
-             * (later ones would punch early, out-of-round). */
+            /* Punch pair: the first QUERY_PEER forms the pair (and wakes the
+             * target); after that each round both edges re-register and the
+             * per-round handoff in sn_pair_on_register exchanges their latest
+             * addresses. While those handoffs are live the direct reply and
+             * the wake-up are suppressed — replying to every QUERY would double
+             * the PUNCH traffic (most visible while a NAT type is still
+             * unknown, where every query used to draw a reply plus a wake-up).
+             * A stale pair (punches stopped) gets its reply back, waking the
+             * target into a fresh round. */
             struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
-            int hard_pair = ( requester &&
-                              punch_pair_hard_nat( requester->nat_type ) &&
-                              punch_pair_hard_nat( target->nat_type ) );
-            int pair_new = 0;
-            if ( hard_pair )
-                pair_new = sn_pair_touch( sss, cmn.community,
+            int pair_new = sn_pair_touch( sss, cmn.community,
                                           query.srcMac, query.targetMac, now );
-            if ( !hard_pair || pair_new )
+            if ( pair_new )
+            {
+                /* The requester's round-0 re-registration arrived before the
+                 * pair existed (register precedes query on the wire), so fold
+                 * it in now: this lets the round-0 handoff fire when the other
+                 * side re-registers and anchors the round-latency sync. */
+                struct sn_punch_pair *pp = sn_pair_find( sss, cmn.community,
+                                                         query.srcMac, query.targetMac );
+                if ( pp )
+                {
+                    if ( memcmp( pp->edge_a, query.srcMac, N2N_MAC_SIZE ) == 0 )
+                        pp->a_reg = now;
+                    else
+                        pp->b_reg = now;
+                }
+            }
+            struct sn_punch_pair *qpair = sn_pair_find( sss, cmn.community,
+                                                        query.srcMac, query.targetMac );
+            int reply = pair_new || !qpair ||
+                        ( now - qpair->last_exchanged ) >= PUNCH_QUERY_REFRESH_SECS;
+            if ( reply )
             {
             memset( &cmn2, 0, sizeof(cmn2) );
             cmn2.ttl   = N2N_DEFAULT_TTL;
@@ -3864,7 +3962,7 @@ static int process_udp( n2n_sn_t * sss,
             }
 
             /* Simultaneous open: also push A's address to B so B punches back */
-            if ( requester && ( !hard_pair || pair_new ) )
+            if ( requester && reply )
             {
                 n2n_PEER_INFO_t pi2;
                 n2n_common_t    cmn3;
@@ -5100,6 +5198,7 @@ static int run_loop( n2n_sn_t * sss )
 
         purge_expired_registrations( &(sss->edges) );
         sn_pair_purge( sss, now );
+        sn_punch_defer_tick( sss );
         sn_ws_purge(sss, now);
         if (sss->traffic_stats_enabled) {
             static time_t last_stats_purge = 0;
