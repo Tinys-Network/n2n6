@@ -37,6 +37,11 @@ static const n2n_sock_t * brother_online_sock(struct n2n_sn *sss, time_t now);
  * big brother). Body sits below, after struct n2n_sn is complete. */
 static int brother_big_index(struct n2n_sn *sss, int slot);
 
+/* Parse a GB quota without floating point: "0.1" -> 100, "1" -> 1000,
+ * in units of 1/1000 GB (~1.02 MB). 0 = unset/unlimited, junk -> 0. */
+#define GB_MILLI 1000
+static unsigned long parse_gb_milli( const char *s );
+
 /* Resolve our [-b] little-brother address (sn2) with caching.
  * Returns 0 on success, -1 if -b is unconfigured or resolution failed. */
 static int resolve_my_brother_addr( struct n2n_sn *sss, n2n_sock_t *out, time_t now );
@@ -727,6 +732,31 @@ static int is_access_action(const char *s)
            (s[0] == 'x' || s[0] == 'X' || s[0] == 'y' || s[0] == 'Y');
 }
 
+/* Parse a GB quota without floating point: "0.1" -> 100, "1" -> 1000,
+ * in units of 1/1000 GB (~1.02 MB). 0 = unset/unlimited, junk -> 0. */
+static unsigned long parse_gb_milli( const char *s )
+{
+    unsigned long whole = 0, frac = 0, scale = GB_MILLI;
+    int digits = 0;
+
+    while (*s >= '0' && *s <= '9')
+        whole = whole * 10 + (unsigned long)(*s++ - '0');
+
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9' && digits < 3) {
+            frac = frac * 10 + (unsigned long)(*s++ - '0');
+            scale /= 10;
+            digits++;
+        }
+        while (*s >= '0' && *s <= '9') s++;   /* extra digits: truncate */
+    }
+    if (*s != 0 && *s != ' ' && *s != '\t' && *s != '\r' && *s != '\n')
+        return 0;                              /* junk: treat as unset */
+
+    return whole * GB_MILLI + frac * scale;
+}
+
 /* Parse -c config file: rate limiting + community access list */
 static void parse_rate_limit_config(const char *datpath,
                                      int *enabled,
@@ -747,7 +777,7 @@ static void parse_rate_limit_config(const char *datpath,
             fprintf(fp, "#\n");
             fprintf(fp, "# Rules: <community> <max_24h_GB> <rate_limit_KB/s> <broadcast_members> <Allow_and_block_lists>\n");
             fprintf(fp, "#   community            : community name, or * for all\n");
-            fprintf(fp, "#   max_24h_GB           : 24h traffic cap in GB (0=unlimited)\n");
+            fprintf(fp, "#   max_24h_GB           : 24h traffic cap in GB (0=unlimited; minimum 0.001)\n");
             fprintf(fp, "#   rate_limit_KB/s      : speed in KB/s once the cap is reached (0=block all)\n");
             fprintf(fp, "#   broadcast_members    : how many members receive broadcast while throttled\n");
             fprintf(fp, "#                      0 : everyone; N : at most N members (default 64)\n");
@@ -795,14 +825,15 @@ static void parse_rate_limit_config(const char *datpath,
         const char *act = NULL;
         if (ntok >= 2 && is_access_action(tok[ntok - 1])) { act = tok[ntok - 1]; ntok--; }
         /* Integer-only parsing: atof and double->uint64 conversion are unreliable
-         * on this embedded/soft-float target and produced UINT64_MAX for any input. */
-        unsigned long max_gb = 0, rate_kbps = 0;
+         * on this embedded/soft-float target and produced UINT64_MAX for any input.
+         * parse_gb_milli() keeps it integer-only while still accepting decimals. */
+        unsigned long max_mgb = 0, rate_kbps = 0;
         int bc = 64;
         if (ntok == 4) {
             bc = atoi(tok[3]);
-            max_gb = strtoul(tok[1], NULL, 10); rate_kbps = strtoul(tok[2], NULL, 10);
+            max_mgb = parse_gb_milli(tok[1]); rate_kbps = strtoul(tok[2], NULL, 10);
         } else if (ntok == 3) {
-            max_gb = strtoul(tok[1], NULL, 10); rate_kbps = strtoul(tok[2], NULL, 10);
+            max_mgb = parse_gb_milli(tok[1]); rate_kbps = strtoul(tok[2], NULL, 10);
         } else if (ntok >= 2) {
             continue; /* unsupported column count, ignore like before */
         }
@@ -811,7 +842,7 @@ static void parse_rate_limit_config(const char *datpath,
         struct rate_limit_rule *r = (struct rate_limit_rule*)calloc(1, sizeof(*r));
         if (!r) continue;
         strncpy((char*)r->community_name, tok[0], sizeof(n2n_community_t) - 1);
-        r->max_24h_bytes  = (uint64_t)max_gb * 1024ULL * 1024ULL * 1024ULL;
+        r->max_24h_bytes  = (uint64_t)max_mgb * (1024ULL * 1024ULL * 1024ULL / GB_MILLI);
         r->rate_limit_bps = (uint64_t)rate_kbps * 1024ULL;
         r->bc_gate = bc;
         if (r->bc_gate <= 0)
