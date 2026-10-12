@@ -1459,6 +1459,28 @@ static void send_register_super( n2n_edge_t * eee,
             memcpy( reg.desired_sn1_mac, eee->sn1_mac, N2N_MAC_SIZE );
     }
 
+    /* When not on the configured home supernode (switched to sn2), declare
+     * sn1 identity on every registration so the backup can recognise this
+     * group regardless of whether sn1 was a domain or a literal IP. */
+    if ( cookie_mode == 0 && eee->sn_idx != 0 )
+    {
+        if ( reg.desired_sn1_sock.port == 0 )
+        {
+            if ( eee->sn1_probe_addr.family == 0 )
+            {
+                n2n_sock_t sn1addr;
+                memset( &sn1addr, 0, sizeof(n2n_sock_t) );
+                supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
+                if ( sn1addr.family != 0 )
+                    eee->sn1_probe_addr = sn1addr;
+            }
+            if ( eee->sn1_probe_addr.family != 0 )
+                reg.desired_sn1_sock = eee->sn1_probe_addr;
+        }
+        if ( !mac_nonzero( reg.desired_sn1_mac ) && mac_nonzero( eee->sn1_mac ) )
+            memcpy( reg.desired_sn1_mac, eee->sn1_mac, N2N_MAC_SIZE );
+    }
+
     /* Gaming mode: first registration asks SN to push all peers */
     if ( cookie_mode == 0 && eee->enable_gaming_mode && !eee->gaming_started) {
         reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;

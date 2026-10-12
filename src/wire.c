@@ -389,6 +389,7 @@ size_t decode_REGISTER_SUPER( n2n_REGISTER_SUPER_t * reg,
                            size_t * idx )
 {
     size_t retval=0;
+    (void)cmn;
     memset( reg, 0, sizeof(n2n_REGISTER_SUPER_t) );
     retval += decode_buf( reg->cookie, N2N_COOKIE_SIZE, base, rem, idx );
     retval += decode_mac( reg->edgeMac, base, rem, idx );
