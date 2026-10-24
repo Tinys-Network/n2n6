@@ -4230,9 +4230,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 
     /* Send header */
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       " id  mac                n2n_ip           wan_ip                                            ver      os       nat\n");
+                       " id  mac                n2n_ip           wan_ip                                            ver        os       nat\n");
 	msg_len += snprintf((char*) (udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                        "---v2.3----------------------------------------------------------------------------------------------------------------\n");
+                        "---v2.3------------------------------------------------------------------------------------------------------------------\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 
@@ -4291,7 +4291,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 }
             }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %2u  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               " %2u  %-17s  %-15s  %-48s  %-9s  %-7.7s  %s\n",
                                id++, macaddr_str(mac, peer->mac_addr), virt_ip,
                                wan, version, os_name,
                                N2N_NAT_NAME(peer->nat_type));
@@ -4369,7 +4369,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             else
                 snprintf(seq, sizeof(seq), "%2u", id++);
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %s  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               " %s  %-17s  %-15s  %-48s  %-9s  %-7.7s  %s\n",
                                seq,
                                macaddr_str(mac, peer->mac_addr), virt_ip,
                                wan, version, os_name,
@@ -4402,7 +4402,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             }
             n2n_sock_str_t rsbuf;
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %2u  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               " %2u  %-17s  %-15s  %-48s  %-9s  %-7.7s  %s\n",
                                rid++, macaddr_str( mac, rp->mac_addr ), rvip,
                                sock_to_cstr( rsbuf, &rp->sock ), rver, ros,
                                N2N_NAT_NAME(rp->nat_type));
@@ -4458,8 +4458,8 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             if ( sn_is_ack_brother(eee, (int)sn_i) && eee->sn_bak_masked[0] )
                 sn_host = eee->sn_bak_masked;
             /* Fixed column widths -> fixed left edges: marker 2, mac 17, host
-             * 65, version 7, tok 7, -b; version/token land on the header columns. */
-            char ver_field[8];
+             * 65, version 9, tok 7, -b; version/token land on the header columns. */
+            char ver_field[10];
             char tok_row[8];
             /* The ACK-learned brother row carries no real data (never configured via
              * -l, never registered to): dash version/token like the MAC/host. */
@@ -4472,11 +4472,19 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 const char *ver_str = ( sn_i == eee->sn_idx &&
                                         eee->supernode_version[0] != '\0' )
                                     ? eee->supernode_version : "-";
-                snprintf(ver_field, sizeof(ver_field), "%.7s", ver_str);
+                size_t vn = 0;
+                while ( ver_str[vn] && vn < sizeof(ver_field) - 1 ) {
+                    if ( ver_str[vn] == '_' && ver_str[vn+1] == 'r' &&
+                         ver_str[vn+2] >= '0' && ver_str[vn+2] <= '9' )
+                        break;
+                    vn++;
+                }
+                memcpy(ver_field, ver_str, vn);
+                ver_field[vn] = '\0';
                 snprintf(tok_row, sizeof(tok_row), "%s", tok_str);
             }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %s  %-17.17s  %-65.65s  %-7.7s  %-7.7s  %s\n",
+                               " %s  %-17.17s  %-65.65s  %-9.9s  %-7.7s  %s\n",
                                marker, mac_str, sn_host, ver_field,
                                tok_row, b_marker);
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
@@ -4486,7 +4494,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 
     /* Send statistics */
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       "----------------------------------------------------------------------------------------------------------------v2.3---\n");
+                       "------------------------------------------------------------------------------------------------------------------v2.3---\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 

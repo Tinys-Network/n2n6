@@ -1336,7 +1336,7 @@ static void deinit_sn( n2n_sn_t * sss )
 /* Mgmt table header, shared by the brother and edges tables so the column
  * positions (e.g. the trailing "os" column) stay in sync. */
 static const char mgmt_header[] =
-    "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver      os       nat\n";
+    "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver        os       nat\n";
 
 /* Emit spaces to bring the current row (whose first byte sits at line_start)
  * up to column col. At least one space is always written, so two adjacent
@@ -1356,7 +1356,7 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
 {
     /* Column offsets inside mgmt_header; sizeof() counts its trailing '\n'
      * and '\0', hence the odd-looking numbers. */
-    const int col_ver = (int)sizeof(mgmt_header) - 23;
+    const int col_ver = (int)sizeof(mgmt_header) - 25;
     const int col_os  = (int)sizeof(mgmt_header) - 14;
     const int col_age = (int)sizeof(mgmt_header) - 5;
 
@@ -1415,32 +1415,34 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
             const char *ver = b->version[0] ? b->version : "-";
             const char *os_name = b->os_name[0] ? b->os_name : "-";
             /* A single-row table cannot be told apart by order alone, so the
-             * little brother carries the "-b" marker (my -b points at it,
-             * i.e. it is the one configured via -b). The big brother
-             * (which configured us as its -b) gets none. */
+             * little brother carries the "-b" marker in the label column, in
+             * place of its row number (my -b points at it, i.e. it is the one
+             * configured via -b). The big brother (which configured us as its
+             * -b) gets none. */
             const char *marker = (b->role == N2N_BROTHER_ROLE_MY_LITTLE)
                                ? "-b" : NULL;
             /* have_v4 || have_v6 holds above, so a stamp is always set. */
             time_t last = b->seen ? b->seen : b->seen6;
 
+            char label[12];
+            if (marker)
+                snprintf(label, sizeof(label), "%s", marker);
+            else
+                snprintf(label, sizeof(label), "%d", counter);
+
             size_t line_start = written;
             written += snprintf(buf + written, bufsz - written,
-                                "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
-                                counter,
+                                "%4s  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
+                                label,
                                 b->mac[0], b->mac[1], b->mac[2],
                                 b->mac[3], b->mac[4], b->mac[5],
                                 v4_part, v6_part);
             written += mgmt_pad_to(buf, bufsz, written, line_start, col_ver);
-            written += snprintf(buf + written, bufsz - written, "%-7.7s", ver);
+            written += snprintf(buf + written, bufsz - written, "%-9.9s", ver);
             written += mgmt_pad_to(buf, bufsz, written, line_start, col_os);
             written += snprintf(buf + written, bufsz - written, "%-7.7s", os_name);
-            /* The little brother's "-b" takes the "nat" column, as it does on
-             * the edge side, and the heartbeat age follows in a fixed-width
-             * slot so it lines up on every row. The slot stays blank on rows
-             * without a marker. */
+            /* The heartbeat age sits in the "nat" column on every row. */
             written += mgmt_pad_to(buf, bufsz, written, line_start, col_age);
-            written += snprintf(buf + written, bufsz - written, "%-7.5s",
-                                marker ? marker : "");
             written += snprintf(buf + written, bufsz - written, "%ld",
                                 (long)(now - last));
             written += snprintf(buf + written, bufsz - written, "\n");
@@ -2215,7 +2217,7 @@ static int process_mgmt( n2n_sn_t * sss,
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s", mgmt_header);
 	if (ressize < N2N_SN_PKTBUF_SIZE)
         ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
-                           "---v2.3----------------------------------------------------------------------------------------------------------------\n");
+                           "---v2.3------------------------------------------------------------------------------------------------------------------\n");
     /* brother table sits between the two v2.3 separator lines */
     ressize += brother_list_format(sss, time(NULL), resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize);
 
@@ -2414,7 +2416,7 @@ static int process_mgmt( n2n_sn_t * sss,
                 }
                 id++;
                 ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                                   "  %2s  %-17s  %-15s  %-47s  %-7s  %-7s  %s\n",
+                                   "  %2s  %-17s  %-15s  %-47s  %-9s  %-7.7s  %s\n",
                                    seq, macaddr_str(mac_buf, edge->mac_addr), virt_ip,
                                    wan, version, os_name,
                                    N2N_NAT_NAME(edge->nat_type));
@@ -2505,7 +2507,7 @@ static int process_mgmt( n2n_sn_t * sss,
 
     /* Send footer and statistics */
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                      "----------------------------------------------------------------------------------------------------------------v2.3---\n");
+                      "------------------------------------------------------------------------------------------------------------------v2.3---\n");
 
     time_t uptime = now - sss->start_time;
     int days = uptime / 86400;
